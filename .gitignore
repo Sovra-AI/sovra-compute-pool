@@ -1,0 +1,6 @@
+/target
+.idea/
+# Generated; hold pool secrets
+/deploy/join-device.sh
+/deploy/pool-info.txt
+/deploy/vpn/

@@ -1,0 +1,22 @@
+# Proves a GPU in the pool is consumable:
+#   kubectl apply -f deploy/gpu-test.yaml && kubectl wait --for=condition=complete job/gpu-test --timeout=180s
+#   kubectl logs job/gpu-test ; kubectl delete job gpu-test
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-test
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: nvidia-smi
+          image: ubuntu:24.04
+          command: ["nvidia-smi"]
+          env:
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          resources:
+            limits:
+              nvidia.com/gpu: 1
