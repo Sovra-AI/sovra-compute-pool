@@ -76,8 +76,28 @@ if ip link show "$VPN_IF" >/dev/null 2>&1; then
   log "pool VPN is up: using address $NODE_IP"
   if [[ $MODE == agent ]]; then
     hub=${K3S_URL#https://}
-    ping -c 1 -W 5 "${hub%%:*}" >/dev/null 2>&1 ||
-      die "VPN settings installed, but the control plane (${hub%%:*}) does not answer over the VPN — check that the address in the settings file's Endpoint line is reachable from here (UDP)"
+    hub=${hub%%:*}
+    reached=false
+    for _ in 1 2 3 4 5 6; do
+      if ping -c 1 -W 3 "$hub" >/dev/null 2>&1; then reached=true; break; fi
+    done
+    if ! $reached; then
+      # Say which half is broken: the path to the control plane, or the VPN on top of it.
+      endpoint=$(wg show "$VPN_IF" endpoints | awk '{print $2; exit}')
+      host=${endpoint%:*}
+      echo "error: the control plane ($hub) does not answer over the pool VPN." >&2
+      echo "  this device's addresses: $(ip -4 -o addr show scope global | awk '{print $2 "=" $4}' | paste -sd' ' -)" >&2
+      echo "  VPN traffic: $(wg show "$VPN_IF" transfer | awk '{print "received " $2 " bytes, sent " $3 " bytes"}')" >&2
+      if ping -c 2 -W 2 "$host" >/dev/null 2>&1; then
+        echo "  $host answers ping, but not on UDP port ${endpoint##*:}: a firewall on the control plane is" >&2
+        echo "  blocking that port, or this invite is no longer valid there (check: sudo wg show $VPN_IF)." >&2
+      else
+        echo "  $host does not answer ping either: this device cannot reach the control plane's" >&2
+        echo "  address. Put both on the same network, or turn off any other VPN / kill switch here" >&2
+        echo "  (or on the control plane) that blocks local-network traffic, then run this again." >&2
+      fi
+      exit 1
+    fi
   fi
 elif [[ $MODE == agent && ${POOL_VPN:-0} == 1 ]]; then
   die "this pool runs over its VPN: on the control plane run  sudo deploy/vpn.sh add <device-name>  and pass the resulting .conf file:  sudo bash $0 <device-name>.conf"
