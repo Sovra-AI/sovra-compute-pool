@@ -60,6 +60,10 @@ sudo deploy/vpn.sh remove gpu-box            # revoke
   `vpn.sh add <device> <host:port>` for one — and forward that UDP port on your router.
 * Devices reach each other through the control plane (hub and spoke), so its uplink carries
   device-to-device traffic.
+* Pod traffic uses the VPN directly. `pool-vpn-sync.service` on the control plane tells
+  WireGuard which device owns which pod range as nodes join and leave (within ~15 s).
+  Nothing is encapsulated a second time, which also keeps it clear of host firewalls that
+  drop kernel-generated tunnel packets to private addresses.
 * Decide before installing the cluster: a cluster built on LAN addresses cannot be switched
   to the VPN without reinstalling its nodes.
 * Each `.conf` holds that device's private key; `deploy/vpn/` is git-ignored.
@@ -70,7 +74,7 @@ What `deploy/node.sh` sets up:
 | :-- | :-- |
 | Kubernetes | K3s (single binary, `stable` channel); agents are pinned to the server's version |
 | GUI | Headlamp at `https://<control-plane-ip>/` via the bundled Traefik ingress; log in with the printed token |
-| Device networking | Flannel `wireguard-native`: pod traffic between devices is encrypted in the kernel (plain VXLAN when the pool VPN already encrypts it) |
+| Device networking | With the pool VPN: pods are routed straight over it (Flannel `host-gw`), no second tunnel. Without it: Flannel `wireguard-native` encrypts pod traffic between devices |
 | GPUs | NVIDIA container toolkit + device plugin; a pod asks for `nvidia.com/gpu: 1` and gets one |
 | Firewall | Opens the needed ports in `ufw`/`firewalld` if one is active |
 | Disk pressure | Absolute eviction floors (5 GiB) instead of kubelet's 10%-free default |

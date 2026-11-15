@@ -8,6 +8,8 @@
 #   sudo deploy/vpn.sh add <device> [host:port]   create settings for one device -> deploy/vpn/<device>.conf
 #   sudo deploy/vpn.sh list                  devices, their pool addresses, last contact
 #   sudo deploy/vpn.sh remove <device>       revoke a device
+#   sudo deploy/vpn.sh sync                  route each node's pods through its VPN peer (runs
+#                                            by itself every few seconds as pool-vpn-sync.service)
 #
 # host:port is where devices reach this machine (default: its LAN address, port 51821). For
 # off-site devices use your public address or DNS name and forward UDP 51821 to this machine.
@@ -18,6 +20,9 @@ set -euo pipefail
 IF=pool0
 NET=${VPN_NET:-10.77.0}
 PORT=${VPN_PORT:-51821}
+# Pod addresses of the cluster. They travel over the VPN directly (no second tunnel), so
+# every device routes this range into the VPN and the hub learns which device owns which part.
+POD_CIDR=${POOL_POD_CIDR:-10.42.0.0/16}
 WG_DIR=${WG_DIR:-/etc/wireguard}
 CONF=$WG_DIR/$IF.conf
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -27,7 +32,7 @@ APPLY=${VPN_APPLY:-1}
 
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 die() { echo "error: $*" >&2; exit 1; }
-usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
 
 need_root() { [[ $APPLY != 1 || $EUID -eq 0 ]] || die "must run as root (use sudo)"; }
 need_pool() { [[ -e $CONF ]] || die "no pool VPN on this machine yet: run  sudo $0 init"; }
@@ -57,7 +62,67 @@ reload() {
   [[ $APPLY == 1 ]] || return 0
   if ip link show "$IF" >/dev/null 2>&1; then
     wg syncconf "$IF" <(wg-quick strip "$IF")
+    cmd_sync || true # syncconf reset the peers to what the file says; put pod routes back
   fi
+}
+
+# Each cluster node's pods live in their own slice of POD_CIDR, assigned by Kubernetes when
+# the node joins. WireGuard only carries a packet to or from a peer if that peer is allowed
+# the address, so tell it: device X = its VPN address + its pod slice. Idempotent; prints
+# only what it changes.
+cmd_sync() {
+  [[ -e $CONF ]] || return 0
+  ip link show "$IF" >/dev/null 2>&1 || return 0
+  command -v k3s >/dev/null || return 0
+  local nodes
+  nodes=$(k3s kubectl get nodes \
+    -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{.spec.podCIDR}{"\n"}{end}' 2>/dev/null) || return 0
+  local live
+  live=$(wg show "$IF" allowed-ips)
+  awk '
+    /^PublicKey = /  { key = $3 }
+    /^AllowedIPs = / { split($3, a, "/"); print key, a[1] }
+  ' "$CONF" | while read -r key addr; do
+    local cidr want have
+    cidr=$(awk -v a="$addr" '$1 == a && $2 ~ /^[0-9.]+\/[0-9]+$/ { print $2; exit }' <<<"$nodes")
+    want="$addr/32${cidr:+,$cidr}"
+    have=$(awk -v k="$key" '$1 == k { for (i = 2; i <= NF; i++) print $i }' <<<"$live" | sort | paste -sd, -)
+    if [[ $(tr ',' '\n' <<<"$want" | sort | paste -sd, -) != "$have" ]]; then
+      wg set "$IF" peer "$key" allowed-ips "$want"
+      echo "pool vpn: $addr now carries ${cidr:-no pod range}"
+    fi
+  done
+}
+
+cmd_watch() {
+  while true; do
+    cmd_sync || true
+    sleep 15
+  done
+}
+
+# Runs `watch` as a service from a copy outside the repo, so moving the repo cannot break it.
+cmd_install_sync() {
+  need_root
+  need_pool
+  [[ $APPLY == 1 ]] || return 0
+  install -m 755 "${BASH_SOURCE[0]}" /usr/local/sbin/pool-vpn
+  cat > /etc/systemd/system/pool-vpn-sync.service <<UNIT
+[Unit]
+Description=Route each cluster node's pods through its pool VPN peer
+After=wg-quick@$IF.service k3s.service
+
+[Service]
+ExecStart=/usr/local/sbin/pool-vpn watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable pool-vpn-sync.service >/dev/null 2>&1
+  systemctl restart pool-vpn-sync.service
 }
 
 endpoint() { sed -n 's/^# endpoint: //p' "$CONF" | head -1; }
@@ -101,6 +166,7 @@ cmd_init() {
       firewall-cmd --reload >/dev/null
     fi
     systemctl enable --now "wg-quick@$IF" >/dev/null
+    cmd_install_sync
   fi
   log "pool VPN created: this machine is $NET.1, devices connect to $ep"
   echo "    next:  sudo $0 add <device-name>      (one per device)"
@@ -146,7 +212,7 @@ cmd_add() {
     echo "PublicKey = $(sed -n 's/^PrivateKey = //p' "$CONF" | wg pubkey)"
     echo "PresharedKey = $psk"
     echo "Endpoint = $ep"
-    echo "AllowedIPs = $NET.0/24"
+    echo "AllowedIPs = $NET.0/24, $POD_CIDR"
     echo "PersistentKeepalive = 25"
   } > "$OUT/$name.conf"
   if [[ -n ${SUDO_USER:-} ]]; then chown -R "$SUDO_USER" "$OUT"; fi
@@ -207,5 +273,8 @@ case ${1:-} in
   add) shift; cmd_add "$@" ;;
   remove) shift; cmd_remove "$@" ;;
   list) cmd_list ;;
+  sync) need_root; cmd_sync ;;
+  watch) need_root; cmd_watch ;;
+  install-sync) cmd_install_sync ;;
   *) usage ;;
 esac

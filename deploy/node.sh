@@ -21,6 +21,12 @@ export PATH=$PATH:/usr/local/bin
 MODE=${1:-}
 VPN_CONF=${2:-}
 VPN_IF=pool0
+POD_CIDR=${POOL_POD_CIDR:-10.42.0.0/16}
+SERVICE=k3s
+if [[ $MODE == agent ]]; then SERVICE=k3s-agent; fi
+# Re-running on a machine that is already in the pool reconfigures it in place.
+RERUN=false
+if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then RERUN=true; fi
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -64,6 +70,11 @@ if [[ $MODE == agent && -n $VPN_CONF ]]; then
   log "connecting to the pool VPN"
   mkdir -p /etc/wireguard
   install -m 600 "$VPN_CONF" "/etc/wireguard/$VPN_IF.conf"
+  # Pod traffic goes straight over the VPN, so this device must route the pod range into
+  # it (settings files issued before that change do not list it yet).
+  if ! grep -q "^AllowedIPs = .*${POD_CIDR//./\\.}" "/etc/wireguard/$VPN_IF.conf"; then
+    sed -i "s#^AllowedIPs = \\(.*\\)\$#AllowedIPs = \\1, $POD_CIDR#" "/etc/wireguard/$VPN_IF.conf"
+  fi
   systemctl enable "wg-quick@$VPN_IF" >/dev/null
   systemctl restart "wg-quick@$VPN_IF"
 fi
@@ -161,8 +172,9 @@ mkdir -p /etc/rancher/k3s
   if $USE_VPN; then echo "flannel-iface: $VPN_IF"; fi
   if [[ $MODE == server ]]; then
     if $USE_VPN; then
-      # The pool VPN already encrypts everything between devices.
-      echo "flannel-backend: vxlan"
+      # The pool VPN already encrypts and carries everything between devices, so pods are
+      # simply routed over it (no second tunnel inside the first).
+      echo "flannel-backend: host-gw"
     else
       # Encrypt pod traffic between devices with kernel WireGuard.
       echo "flannel-backend: wireguard-native"
@@ -195,10 +207,20 @@ elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1;
 fi
 
 # ---------------------------------------------------------------- install
+# The installer only restarts K3s when its own files changed, not when ours did.
+apply_changes() {
+  $RERUN || return 0
+  log "restarting $SERVICE to apply the new settings"
+  # A tunnel device left over from an earlier network mode would keep its stale routes.
+  ip link delete flannel.1 2>/dev/null || true
+  systemctl restart "$SERVICE"
+}
+
 if [[ $MODE == agent ]]; then
   log "joining the pool at $K3S_URL"
   curl -sfL https://get.k3s.io |
     INSTALL_K3S_VERSION=${K3S_VERSION:-} K3S_URL=$K3S_URL K3S_TOKEN=$K3S_TOKEN sh -s - agent
+  apply_changes
   log "done: this device registers itself on every boot (service: k3s-agent)"
   echo "    check from the control plane:  kubectl get nodes"
   echo "    leave the pool:                sudo k3s-agent-uninstall.sh"
@@ -207,6 +229,7 @@ fi
 
 log "installing the control plane"
 curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${K3S_VERSION:-} sh -s - server
+apply_changes
 K="k3s kubectl"
 
 wait_for() { # wait_for <seconds> <description> <command...>

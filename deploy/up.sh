@@ -19,3 +19,8 @@ if [[ ${POOL_VPN:-1} == 1 && ! -e /etc/wireguard/pool0.conf ]]; then
   "$HERE/vpn.sh" init ${VPN_ENDPOINT:+"$VPN_ENDPOINT"}
 fi
 "$HERE/node.sh" server
+# Keep pod routing over the VPN in step with the nodes (also refreshes the installed copy).
+if [[ -e /etc/wireguard/pool0.conf ]]; then
+  "$HERE/vpn.sh" install-sync
+  "$HERE/vpn.sh" sync
+fi
