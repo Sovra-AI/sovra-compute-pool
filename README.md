@@ -18,9 +18,15 @@ sudo deploy/node.sh server
 #   -> prints the GUI address (https://<ip>/), a login token, and writes deploy/join-device.sh
 
 # For every device to add (Linux + systemd; NVIDIA driver installed if it has a GPU):
-scp deploy/join-device.sh <user>@<device>:
-ssh -t <user>@<device> sudo bash join-device.sh
+sudo deploy/invite.sh <device-name>        # here: prints a one-line invite code (a secret)
+git clone <this repo> && cd <repo>         # on the device
+sudo deploy/join.sh <invite-code>          # on the device: joins (and connects the pool VPN)
 ```
+
+The invite code carries the cluster's join secret and, when the pool uses its VPN, that
+device's VPN settings, so nothing secret has to live in the repo. Without git on the
+device, copy `deploy/join-device.sh` (plus `deploy/vpn/<device>.conf` when using the VPN)
+to it and run `sudo bash join-device.sh [<device>.conf]` instead.
 
 After that one-time join, the device runs `k3s-agent` as a service: every time it boots it
 registers with the control plane by itself, and its CPUs, memory and GPUs are schedulable.
@@ -42,9 +48,8 @@ pool address (`10.77.0.x`) and the cluster runs over it.
 ```sh
 sudo deploy/vpn.sh init                      # before `node.sh server`; this machine becomes 10.77.0.1
 sudo deploy/node.sh server                   # detects the VPN and builds the cluster on it
-sudo deploy/vpn.sh add gpu-box               # -> deploy/vpn/gpu-box.conf (one file per device)
-scp deploy/join-device.sh deploy/vpn/gpu-box.conf <user>@<device>:
-ssh -t <user>@<device> sudo bash join-device.sh gpu-box.conf   # connects the VPN, then joins
+sudo deploy/invite.sh gpu-box                # creates gpu-box's VPN settings and prints its invite
+sudo deploy/join.sh <invite-code>            # on the device: connects the VPN, then joins
 
 sudo deploy/vpn.sh list                      # devices, addresses, last contact
 sudo deploy/vpn.sh remove gpu-box            # revoke
