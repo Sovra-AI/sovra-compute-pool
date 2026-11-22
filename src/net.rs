@@ -31,11 +31,22 @@ pub struct Identity {
 impl Identity {
     pub fn load_or_create(dir: &Path) -> Result<Self> {
         let (cert_path, key_path) = (dir.join("cluster.crt"), dir.join("cluster.key"));
-        if cert_path.exists() && key_path.exists() {
-            return Ok(Self {
-                cert_pem: std::fs::read_to_string(cert_path)?,
-                key_pem: std::fs::read_to_string(key_path)?,
-            });
+        match (cert_path.exists(), key_path.exists()) {
+            (true, true) => {
+                return Ok(Self {
+                    cert_pem: std::fs::read_to_string(&cert_path)
+                        .with_context(|| format!("reading {}", cert_path.display()))?,
+                    key_pem: std::fs::read_to_string(&key_path)
+                        .with_context(|| format!("reading {}", key_path.display()))?,
+                });
+            }
+            (false, false) => {}
+            // A new identity would silently invalidate every device's token.
+            _ => bail!(
+                "{} has only half of the cluster identity (cluster.crt and cluster.key); restore the \
+                 missing file, or delete both to start a new cluster that every device must rejoin",
+                dir.display()
+            ),
         }
         let generated = rcgen::generate_simple_self_signed(vec![TLS_NAME.to_owned()])
             .context("generating cluster certificate")?;
@@ -116,7 +127,11 @@ impl fmt::Display for Token {
 }
 
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// A non-2xx answer from a cluster endpoint.
@@ -134,16 +149,32 @@ impl fmt::Display for ApiFailure {
 
 impl std::error::Error for ApiFailure {}
 
-pub async fn resolve(addr: &str) -> Result<SocketAddr> {
+/// `addr` as `host:port` for a lookup, adding [`DEFAULT_PORT`] when no port is given.
+/// Accepts `host`, `host:port`, `1.2.3.4`, `::1`, `[::1]` and `[::1]:port`, optionally with a
+/// leading `https://` or a trailing `/`.
+pub fn with_default_port(addr: &str) -> String {
     let addr = addr
         .trim()
         .trim_start_matches("https://")
         .trim_end_matches('/');
-    let with_port = if addr.parse::<SocketAddr>().is_ok() || addr.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
-        addr.to_owned()
-    } else {
-        format!("{addr}:{DEFAULT_PORT}")
-    };
+    if addr.parse::<SocketAddr>().is_ok() {
+        return addr.to_owned();
+    }
+    if let Ok(ip) = addr
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        return SocketAddr::new(ip, DEFAULT_PORT).to_string();
+    }
+    match addr.rsplit_once(':') {
+        Some((_, port)) if port.parse::<u16>().is_ok() => addr.to_owned(),
+        _ => format!("{addr}:{DEFAULT_PORT}"),
+    }
+}
+
+pub async fn resolve(addr: &str) -> Result<SocketAddr> {
+    let with_port = with_default_port(addr);
     let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(&with_port)
         .await
         .with_context(|| format!("resolving {with_port}"))?
@@ -200,7 +231,9 @@ impl Endpoint {
             .text()
             .await?;
         if !constant_time_eq(&fingerprint(&cert_pem), &token.fingerprint) {
-            bail!("the server at {addr} does not match this token (wrong cluster, or someone is intercepting the connection)");
+            bail!(
+                "the server at {addr} does not match this token (wrong cluster, or someone is intercepting the connection)"
+            );
         }
         Ok((Self::pinned(addr, &cert_pem, &token.secret)?, cert_pem))
     }
@@ -253,32 +286,19 @@ pub async fn send_json<T: DeserializeOwned>(request: reqwest::RequestBuilder) ->
 /// IPv4 addresses of this machine that other devices could plausibly reach (interfaces that
 /// are up, not loopback, not point-to-point tunnels).
 pub fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
-    let mut found = Vec::new();
-    // SAFETY: getifaddrs hands back a linked list that stays valid until freeifaddrs; every
-    // pointer is null-checked before it is dereferenced.
-    unsafe {
-        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut list) != 0 {
-            return found;
-        }
-        let mut cursor = list;
-        while !cursor.is_null() {
-            let ifa = &*cursor;
-            cursor = ifa.ifa_next;
-            let flags = ifa.ifa_flags as i32;
-            let usable = flags & libc::IFF_UP != 0
-                && flags & (libc::IFF_LOOPBACK | libc::IFF_POINTOPOINT) == 0;
-            if !usable || ifa.ifa_addr.is_null() {
-                continue;
-            }
-            if i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET {
-                let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                found.push(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
-            }
-        }
-        libc::freeifaddrs(list);
-    }
-    found
+    use nix::net::if_::InterfaceFlags;
+    let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .filter(|ifa| {
+            ifa.flags.contains(InterfaceFlags::IFF_UP)
+                && !ifa
+                    .flags
+                    .intersects(InterfaceFlags::IFF_LOOPBACK | InterfaceFlags::IFF_POINTOPOINT)
+        })
+        .filter_map(|ifa| Some(ifa.address?.as_sockaddr_in()?.ip()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -287,13 +307,46 @@ mod tests {
 
     #[test]
     fn token_round_trips_and_rejects_garbage() {
-        let token = Token::generate("-----BEGIN CERTIFICATE-----\nAAAA\nBBBB\n-----END CERTIFICATE-----\n");
+        let token =
+            Token::generate("-----BEGIN CERTIFICATE-----\nAAAA\nBBBB\n-----END CERTIFICATE-----\n");
         let parsed = Token::parse(&token.to_string()).unwrap();
         assert_eq!(parsed.fingerprint, token.fingerprint);
         assert_eq!(parsed.secret, token.secret);
         assert_ne!(parsed.peer_key(), parsed.secret);
         assert!(Token::parse("da1.short.x").is_err());
         assert!(Token::parse("nonsense").is_err());
+    }
+
+    #[test]
+    fn default_port_is_added_only_when_missing() {
+        for (input, expected) in [
+            ("10.0.0.5", "10.0.0.5:7443"),
+            ("10.0.0.5:9000", "10.0.0.5:9000"),
+            ("https://pool.lan/", "pool.lan:7443"),
+            ("pool.lan:8443", "pool.lan:8443"),
+            ("::1", "[::1]:7443"),
+            ("[fe80::1]", "[fe80::1]:7443"),
+            ("[::1]:9000", "[::1]:9000"),
+        ] {
+            assert_eq!(with_default_port(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn token_comparison_is_exact() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "abcd"));
+    }
+
+    #[test]
+    fn token_parse_trims_whitespace_and_requires_the_prefix() {
+        let fp = "0".repeat(32);
+        let parsed = Token::parse(&format!("  da1.{fp}.secret\n")).expect("valid token");
+        assert_eq!(parsed.secret, "secret");
+        assert!(Token::parse(&format!("da2.{fp}.secret")).is_err());
+        assert!(Token::parse(&format!("da1.{fp}.")).is_err());
+        assert!(Token::parse(&format!("da1.{fp}.a.b")).is_err());
     }
 
     #[test]

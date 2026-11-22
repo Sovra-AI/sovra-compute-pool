@@ -155,7 +155,10 @@ pub enum TaskState {
 
 impl TaskState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Killed | Self::Lost)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Killed | Self::Lost
+        )
     }
 }
 
@@ -299,4 +302,93 @@ pub struct PutBlobResp {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ApiError {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blob(name: &str) -> Blob {
+        Blob {
+            name: name.into(),
+            hash: "0".repeat(64),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn hashes_are_64_lowercase_hex_digits() {
+        assert!(is_hash(&"a1".repeat(32)));
+        assert!(!is_hash(&"A1".repeat(32)));
+        assert!(!is_hash(&"a".repeat(63)));
+        assert!(!is_hash(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn input_names_cannot_escape_the_inputs_directory() {
+        for ok in ["train.py", "corpus/shard-0.bin", "a/b/c"] {
+            assert!(safe_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../../x",
+            "a//b",
+            "./x",
+            "a/",
+            "x\0y",
+        ] {
+            assert!(!safe_name(bad), "{bad:?}");
+        }
+        assert!(!safe_name(&"x".repeat(256)));
+    }
+
+    #[test]
+    fn shards_are_dealt_round_robin_and_shared_inputs_go_to_everyone() {
+        let spec = JobSpec {
+            name: String::new(),
+            command: vec!["true".into()],
+            env: BTreeMap::new(),
+            resources: Resources {
+                cpus: 1,
+                memory_mb: 1,
+                gpus: 0,
+                gpu_memory_mb: 0,
+            },
+            replicas: 2,
+            inputs: vec![blob("train.py")],
+            shards: (0..5).map(|i| blob(&format!("s{i}"))).collect(),
+            selector: BTreeMap::new(),
+            max_retries: 0,
+            priority: 0,
+        };
+        let names = |rank| -> Vec<String> {
+            spec.inputs_for_rank(rank)
+                .into_iter()
+                .map(|b| b.name)
+                .collect()
+        };
+        assert_eq!(names(0), ["train.py", "s0", "s2", "s4"]);
+        assert_eq!(names(1), ["train.py", "s1", "s3"]);
+    }
+
+    #[test]
+    fn only_finished_states_are_terminal() {
+        assert!(!JobState::Queued.is_terminal() && !JobState::Running.is_terminal());
+        assert!(JobState::Cancelled.is_terminal());
+        assert!(!TaskState::Fetching.is_terminal());
+        assert!(TaskState::Lost.is_terminal() && TaskState::Killed.is_terminal());
+    }
+
+    #[test]
+    fn older_job_specs_without_optional_fields_still_parse() {
+        let spec: JobSpec = serde_json::from_str(
+            r#"{"command":["nvidia-smi"],"resources":{"cpus":1,"memory_mb":512,"gpus":1},"replicas":1}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.resources.gpu_memory_mb, 0);
+        assert!(spec.inputs.is_empty() && spec.selector.is_empty());
+        assert_eq!((spec.max_retries, spec.priority), (0, 0));
+    }
 }

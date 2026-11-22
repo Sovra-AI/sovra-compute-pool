@@ -69,7 +69,15 @@ pub fn place(spec: &JobSpec, nodes: &mut Vec<NodeFree<'_>>) -> Result<Vec<Placem
                     .sum();
                 let gpus_left = node.gpus.len() - need.gpus as usize;
                 // Most cached input bytes, then fewest GPUs left idle, then most free CPU.
-                Some((i, (std::cmp::Reverse(cached), gpus_left, std::cmp::Reverse(node.cpus), node.name)))
+                Some((
+                    i,
+                    (
+                        std::cmp::Reverse(cached),
+                        gpus_left,
+                        std::cmp::Reverse(node.cpus),
+                        node.name,
+                    ),
+                ))
             })
             .min_by(|a, b| a.1.cmp(&b.1))
             .map(|(i, _)| i);
@@ -150,7 +158,7 @@ mod tests {
             name,
             cpus,
             memory_mb: 64_000,
-            gpus: gpus.iter().enumerate().map(|(i, v)| (i as u32, *v)).collect(),
+            gpus: gpus.iter().zip(0..).map(|(v, i)| (i, *v)).collect(),
             labels,
             blobs: None,
         }
@@ -159,11 +167,18 @@ mod tests {
     #[test]
     fn gang_is_all_or_nothing() {
         let labels = BTreeMap::new();
-        let mut nodes = vec![node("a", 8, &[24_000], &labels), node("b", 8, &[24_000], &labels)];
+        let mut nodes = vec![
+            node("a", 8, &[24_000], &labels),
+            node("b", 8, &[24_000], &labels),
+        ];
 
         let err = place(&spec(1, 1, 3), &mut nodes).unwrap_err();
         assert!(err.contains("2 of 3"), "{err}");
-        assert_eq!(nodes[0].gpus.len() + nodes[1].gpus.len(), 2, "nothing was reserved");
+        assert_eq!(
+            nodes[0].gpus.len() + nodes[1].gpus.len(),
+            2,
+            "nothing was reserved"
+        );
 
         let placed = place(&spec(1, 1, 2), &mut nodes).unwrap();
         let mut hosts: Vec<&str> = placed.iter().map(|p| p.node.as_str()).collect();
@@ -176,13 +191,22 @@ mod tests {
     #[test]
     fn cpu_jobs_avoid_gpu_nodes_and_gpu_jobs_take_the_smallest_adequate_card() {
         let labels = BTreeMap::new();
-        let mut nodes = vec![node("gpu", 32, &[12_000, 48_000], &labels), node("cpu", 4, &[], &labels)];
+        let mut nodes = vec![
+            node("gpu", 32, &[12_000, 48_000], &labels),
+            node("cpu", 4, &[], &labels),
+        ];
 
         let placed = place(&spec(2, 0, 1), &mut nodes).unwrap();
         assert_eq!(placed[0].node, "cpu");
 
         let placed = place(&spec(2, 1, 1), &mut nodes).unwrap();
-        assert_eq!(placed[0], Placement { node: "gpu".into(), gpus: vec![0] });
+        assert_eq!(
+            placed[0],
+            Placement {
+                node: "gpu".into(),
+                gpus: vec![0]
+            }
+        );
 
         let mut big = spec(2, 1, 1);
         big.resources.gpu_memory_mb = 40_000;
@@ -191,7 +215,11 @@ mod tests {
 
     #[test]
     fn prefers_the_node_that_already_has_the_data_and_honours_selectors() {
-        let shard = Blob { name: "shard-0".into(), hash: "a".repeat(64), size: 128 << 20 };
+        let shard = Blob {
+            name: "shard-0".into(),
+            hash: "a".repeat(64),
+            size: 128 << 20,
+        };
         let warm_cache = HashMap::from([(shard.hash.clone(), shard.size)]);
         let plain = BTreeMap::new();
         let office = BTreeMap::from([("site".to_owned(), "office".to_owned())]);
@@ -204,6 +232,9 @@ mod tests {
 
         let mut pinned = spec(1, 0, 1);
         pinned.selector = BTreeMap::from([("site".to_owned(), "lab".to_owned())]);
-        assert_eq!(place(&pinned, &mut nodes).unwrap_err(), "no ready node matches the selector");
+        assert_eq!(
+            place(&pinned, &mut nodes).unwrap_err(),
+            "no ready node matches the selector"
+        );
     }
 }

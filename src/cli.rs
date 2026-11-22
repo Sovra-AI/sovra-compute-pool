@@ -9,7 +9,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::AsyncWriteExt;
 
 use crate::net::{self, Endpoint, Token};
-use crate::proto::*;
+use crate::proto::{
+    Blob, BlobSources, Hash, JobSpec, JobState, JobView, LogChunk, NodeView, PutBlobResp,
+    Resources, TaskState, is_hash,
+};
 use crate::store::hash_file;
 
 #[derive(clap::Args)]
@@ -41,10 +44,10 @@ pub struct SubmitArgs {
     /// Environment variable for the command (repeatable)
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
-    /// Local file to ship to the nodes as $DA_INPUTS_DIR/NAME (repeatable)
+    /// Local file to ship to the nodes as $`DA_INPUTS_DIR/NAME` (repeatable)
     #[arg(short, long = "input", value_name = "[NAME=]PATH")]
     pub inputs: Vec<String>,
-    /// Dataset to stage as $DA_INPUTS_DIR/<dataset>/<file> (repeatable)
+    /// Dataset to stage as $`DA_INPUTS_DIR`/<dataset>/<file> (repeatable)
     #[arg(long = "dataset", value_name = "NAME")]
     pub datasets: Vec<String>,
     /// Deal dataset files out across the replicas (rank r stages every replicas-th file)
@@ -69,17 +72,20 @@ pub fn data_home() -> PathBuf {
 
 /// Connects using `--server/--token`, falling back to the control plane on this machine.
 pub async fn connect(server: Option<String>, token: Option<String>) -> Result<Endpoint> {
-    let token = match token {
-        Some(token) => token,
-        None => {
-            let path = data_home().join("server/token");
-            std::fs::read_to_string(&path).map_err(|_| {
-                anyhow!("no token: pass --token, set DA_TOKEN, or run this on the control-plane machine")
-            })?
-        }
+    let token = if let Some(token) = token {
+        token
+    } else {
+        let path = data_home().join("server/token");
+        std::fs::read_to_string(&path).map_err(|_| {
+            anyhow!(
+                "no token: pass --token, set DA_TOKEN, or run this on the control-plane machine"
+            )
+        })?
     };
     let server = server.unwrap_or_else(|| format!("127.0.0.1:{}", net::DEFAULT_PORT));
-    Ok(Endpoint::bootstrap(&server, &Token::parse(&token)?).await?.0)
+    Ok(Endpoint::bootstrap(&server, &Token::parse(&token)?)
+        .await?
+        .0)
 }
 
 pub fn key_values(pairs: &[String], what: &str) -> Result<BTreeMap<String, String>> {
@@ -172,14 +178,27 @@ pub async fn nodes(ep: &Endpoint, json: bool) -> Result<()> {
                     .collect();
                 models.dedup();
                 let busy: u32 = n.stats.gpus.iter().map(|g| g.util_pct).max().unwrap_or(0);
-                format!("{}/{} {} ({busy}% busy)", n.alloc_gpus.len(), n.info.gpus.len(), models.join(", "))
+                format!(
+                    "{}/{} {} ({busy}% busy)",
+                    n.alloc_gpus.len(),
+                    n.info.gpus.len(),
+                    models.join(", ")
+                )
             };
             vec![
                 n.name.clone(),
-                if n.ready { "ready".into() } else { format!("lost {}s", n.last_seen_secs) },
+                if n.ready {
+                    "ready".into()
+                } else {
+                    format!("lost {}s", n.last_seen_secs)
+                },
                 n.host.clone(),
                 format!("{}/{}", n.alloc_cpus, n.info.cpus),
-                format!("{:.1}/{:.1}G", n.alloc_memory_mb as f64 / 1024.0, n.info.memory_mb as f64 / 1024.0),
+                format!(
+                    "{:.1}/{:.1}G",
+                    n.alloc_memory_mb as f64 / 1024.0,
+                    n.info.memory_mb as f64 / 1024.0
+                ),
                 gpu,
                 format!("{:.2}", n.stats.load1),
                 gib(n.stats.disk_free_bytes),
@@ -189,7 +208,18 @@ pub async fn nodes(ep: &Endpoint, json: bool) -> Result<()> {
         })
         .collect();
     table(
-        &["NODE", "STATUS", "HOST", "CPU", "MEM", "GPU", "LOAD", "DISK FREE", "BLOBS", "TASKS"],
+        &[
+            "NODE",
+            "STATUS",
+            "HOST",
+            "CPU",
+            "MEM",
+            "GPU",
+            "LOAD",
+            "DISK FREE",
+            "BLOBS",
+            "TASKS",
+        ],
         &rows,
     );
     let ready: Vec<&NodeView> = nodes.iter().filter(|n| n.ready).collect();
@@ -224,7 +254,8 @@ async fn upload(ep: &Endpoint, path: &Path) -> Result<(Hash, u64)> {
         return Ok((hash, size));
     }
     let file = tokio::fs::File::open(path).await?;
-    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(file, 1 << 16));
+    let body =
+        reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(file, 1 << 16));
     let stored: PutBlobResp = net::send_json(
         ep.put("/v1/blobs")
             .header(reqwest::header::CONTENT_LENGTH, size)
@@ -282,7 +313,11 @@ pub async fn dataset_create(ep: &Endpoint, name: &str, files: &[PathBuf]) -> Res
     for path in files {
         let (hash, size) = upload(ep, path).await?;
         eprintln!("  {}  {:>8}  {}", &hash[..12], bytes(size), path.display());
-        entries.push(Blob { name: file_name(path)?, hash, size });
+        entries.push(Blob {
+            name: file_name(path)?,
+            hash,
+            size,
+        });
     }
     net::send(ep.put(&format!("/v1/datasets/{name}")).json(&entries)).await?;
     println!(
@@ -298,7 +333,11 @@ pub async fn dataset_list(ep: &Endpoint) -> Result<()> {
     let rows: Vec<Vec<String>> = datasets
         .iter()
         .map(|(name, files)| {
-            vec![name.clone(), files.len().to_string(), bytes(files.iter().map(|f| f.size).sum())]
+            vec![
+                name.clone(),
+                files.len().to_string(),
+                bytes(files.iter().map(|f| f.size).sum()),
+            ]
         })
         .collect();
     table(&["DATASET", "FILES", "SIZE"], &rows);
@@ -320,10 +359,14 @@ pub async fn submit(ep: &Endpoint, args: SubmitArgs) -> Result<JobView> {
     if !args.datasets.is_empty() {
         let known: BTreeMap<String, Vec<Blob>> = net::send_json(ep.get("/v1/datasets")).await?;
         for dataset in &args.datasets {
-            let files = known
-                .get(dataset)
-                .ok_or_else(|| anyhow!("no dataset named {dataset:?} (see `dist-alloc dataset ls`)"))?;
-            let target = if args.partition { &mut shards } else { &mut inputs };
+            let files = known.get(dataset).ok_or_else(|| {
+                anyhow!("no dataset named {dataset:?} (see `dist-alloc dataset ls`)")
+            })?;
+            let target = if args.partition {
+                &mut shards
+            } else {
+                &mut inputs
+            };
             target.extend(files.iter().map(|f| Blob {
                 name: format!("{dataset}/{}", f.name),
                 ..f.clone()
@@ -331,7 +374,13 @@ pub async fn submit(ep: &Endpoint, args: SubmitArgs) -> Result<JobView> {
         }
     }
     let spec = JobSpec {
-        name: args.name.unwrap_or_else(|| args.command[0].rsplit('/').next().unwrap_or("job").to_owned()),
+        name: args.name.unwrap_or_else(|| {
+            args.command[0]
+                .rsplit('/')
+                .next()
+                .unwrap_or("job")
+                .to_owned()
+        }),
         command: args.command,
         env: key_values(&args.env, "--env")?,
         resources: Resources {
@@ -358,7 +407,11 @@ fn placement(job: &JobView) -> String {
         .map(|t| t.node.as_str())
         .collect();
     nodes.dedup();
-    if nodes.is_empty() { "-".into() } else { nodes.join(",") }
+    if nodes.is_empty() {
+        "-".into()
+    } else {
+        nodes.join(",")
+    }
 }
 
 pub async fn jobs(ep: &Endpoint, json: bool) -> Result<()> {
@@ -381,7 +434,10 @@ pub async fn jobs(ep: &Endpoint, json: bool) -> Result<()> {
             ]
         })
         .collect();
-    table(&["JOB", "NAME", "STATE", "SHAPE", "NODES", "AGE", "NOTE"], &rows);
+    table(
+        &["JOB", "NAME", "STATE", "SHAPE", "NODES", "AGE", "NOTE"],
+        &rows,
+    );
     Ok(())
 }
 
@@ -392,16 +448,30 @@ pub async fn job(ep: &Endpoint, id: &str, json: bool) -> Result<()> {
     }
     let r = &job.spec.resources;
     println!("job      {} ({})", job.id, job.spec.name);
-    println!("state    {}{}", format!("{:?}", job.state).to_lowercase(), job.message.as_deref().map(|m| format!(" — {m}")).unwrap_or_default());
+    println!(
+        "state    {}{}",
+        format!("{:?}", job.state).to_lowercase(),
+        job.message
+            .as_deref()
+            .map(|m| format!(" — {m}"))
+            .unwrap_or_default()
+    );
     println!("command  {}", job.spec.command.join(" "));
-    println!("shape    {} replica(s), each {} cpu, {} MB, {} gpu", job.spec.replicas, r.cpus, r.memory_mb, r.gpus);
+    println!(
+        "shape    {} replica(s), each {} cpu, {} MB, {} gpu",
+        job.spec.replicas, r.cpus, r.memory_mb, r.gpus
+    );
     let staged: Vec<&Blob> = job.spec.inputs.iter().chain(&job.spec.shards).collect();
     if !staged.is_empty() {
         println!(
             "inputs   {} files, {}{}",
             staged.len(),
             bytes(staged.iter().map(|i| i.size).sum()),
-            if job.spec.shards.is_empty() { "" } else { " (dataset files dealt across replicas)" }
+            if job.spec.shards.is_empty() {
+                ""
+            } else {
+                " (dataset files dealt across replicas)"
+            }
         );
     }
     let rows: Vec<Vec<String>> = job
@@ -411,7 +481,11 @@ pub async fn job(ep: &Endpoint, id: &str, json: bool) -> Result<()> {
             vec![
                 t.id.clone(),
                 t.node.clone(),
-                if t.gpus.is_empty() { "-".into() } else { format!("{:?}", t.gpus) },
+                if t.gpus.is_empty() {
+                    "-".into()
+                } else {
+                    format!("{:?}", t.gpus)
+                },
                 format!("{:?}", t.state).to_lowercase(),
                 t.exit_code.map(|c| c.to_string()).unwrap_or_default(),
                 t.message.clone().unwrap_or_default(),
@@ -424,11 +498,28 @@ pub async fn job(ep: &Endpoint, id: &str, json: bool) -> Result<()> {
         .tasks
         .iter()
         .filter(|t| t.attempt == job.attempt)
-        .flat_map(|t| t.outputs.iter().map(move |o| vec![format!("r{}", t.rank), o.name.clone(), bytes(o.size), o.hash.clone()]))
+        .flat_map(|t| {
+            t.outputs.iter().map(move |o| {
+                vec![
+                    format!("r{}", t.rank),
+                    o.name.clone(),
+                    bytes(o.size),
+                    o.hash.clone(),
+                ]
+            })
+        })
         .collect();
     if !outputs.is_empty() {
         println!();
-        table(&["RANK", "OUTPUT", "SIZE", "HASH (dist-alloc blob get <hash> -o <file>)"], &outputs);
+        table(
+            &[
+                "RANK",
+                "OUTPUT",
+                "SIZE",
+                "HASH (dist-alloc blob get <hash> -o <file>)",
+            ],
+            &outputs,
+        );
     }
     Ok(())
 }
@@ -449,8 +540,18 @@ pub async fn logs(ep: &Endpoint, id: &str, follow: bool) -> Result<i32> {
         let job: JobView = net::send_json(ep.get(&format!("/v1/jobs/{id}"))).await?;
         if follow {
             let status = match job.state {
-                JobState::Queued => format!("{id} queued{}", job.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default()),
-                JobState::Running => format!("{id} running on {} (attempt {})", placement(&job), job.attempt),
+                JobState::Queued => format!(
+                    "{id} queued{}",
+                    job.message
+                        .as_deref()
+                        .map(|m| format!(": {m}"))
+                        .unwrap_or_default()
+                ),
+                JobState::Running => format!(
+                    "{id} running on {} (attempt {})",
+                    placement(&job),
+                    job.attempt
+                ),
                 _ => String::new(),
             };
             if !status.is_empty() && status != announced {
@@ -488,11 +589,15 @@ pub async fn logs(ep: &Endpoint, id: &str, follow: bool) -> Result<i32> {
                 eprintln!(
                     "[{id} {}{}]",
                     format!("{:?}", job.state).to_lowercase(),
-                    job.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default()
+                    job.message
+                        .as_deref()
+                        .map(|m| format!(": {m}"))
+                        .unwrap_or_default()
                 );
             }
             return Ok(match job.state {
-                JobState::Succeeded => 0,
+                // Without --follow a job may still be going; its output so far printed fine.
+                JobState::Succeeded | JobState::Queued | JobState::Running => 0,
                 JobState::Failed => job
                     .tasks
                     .iter()
@@ -501,9 +606,30 @@ pub async fn logs(ep: &Endpoint, id: &str, follow: bool) -> Result<i32> {
                     .filter(|code| *code != 0)
                     .unwrap_or(1),
                 JobState::Cancelled => 130,
-                _ => 0,
             });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_are_printed_in_the_largest_whole_unit() {
+        assert_eq!(bytes(512), "512B");
+        assert_eq!(bytes(1536), "1.5K");
+        assert_eq!(bytes(5 << 20), "5.0M");
+        assert_eq!(bytes(3 << 30), "3.0G");
+    }
+
+    #[test]
+    fn labels_and_env_must_be_key_value_pairs() {
+        let parsed = key_values(&["site=lab".into(), "url=a=b".into()], "--label").unwrap();
+        assert_eq!(parsed["site"], "lab");
+        assert_eq!(parsed["url"], "a=b", "only the first = splits");
+        let err = key_values(&["oops".into()], "--label").unwrap_err();
+        assert!(err.to_string().contains("--label \"oops\""), "{err}");
     }
 }

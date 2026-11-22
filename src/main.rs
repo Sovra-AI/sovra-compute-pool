@@ -22,7 +22,11 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "dist-alloc", version, about = "Pool CPUs and GPUs across machines and run jobs on them")]
+#[command(
+    name = "dist-alloc",
+    version,
+    about = "Pool CPUs and GPUs across machines and run jobs on them"
+)]
 struct Cli {
     /// Control plane address [default: this machine]
     #[arg(long, global = true, env = "DA_SERVER", value_name = "HOST[:PORT]")]
@@ -150,6 +154,15 @@ enum DatasetCommand {
     Ls,
 }
 
+/// Locks `mutex`, recovering the data if a thread panicked while holding it: every critical
+/// section here leaves the state consistent between statements, so a panic elsewhere must
+/// not take the whole agent or control plane down with it.
+pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Resolves on SIGINT or SIGTERM.
 pub async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
@@ -160,12 +173,21 @@ pub async fn shutdown_signal() {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to >= 0 first, and `as` saturates at u64::MAX"
+)]
 fn gb(value: f64) -> u64 {
     (value.max(0.0) * (1u64 << 30) as f64) as u64
 }
 
 async fn run(cli: Cli) -> Result<i32> {
-    let Cli { server, token, command } = cli;
+    let Cli {
+        server,
+        token,
+        command,
+    } = cli;
     match command {
         Command::Server { listen, data_dir } => {
             let data_dir = data_dir.unwrap_or_else(|| cli::data_home().join("server"));
@@ -183,7 +205,9 @@ async fn run(cli: Cli) -> Result<i32> {
             cache_max_gb,
             min_free_gb,
         } => {
-            let token = token.ok_or_else(|| anyhow!("--token is required (run `dist-alloc token` on the control-plane machine)"))?;
+            let token = token.ok_or_else(|| {
+                anyhow!("--token is required (run `dist-alloc token` on the control-plane machine)")
+            })?;
             agent::run(agent::AgentOpts {
                 server: server.ok_or_else(|| anyhow!("--server is required"))?,
                 token: net::Token::parse(&token)?,
@@ -204,14 +228,23 @@ async fn run(cli: Cli) -> Result<i32> {
             .await?;
         }
         Command::Token { data_dir } => {
-            let path = data_dir.unwrap_or_else(|| cli::data_home().join("server")).join("token");
-            let token = std::fs::read_to_string(&path)
-                .with_context(|| format!("no control plane has run here yet ({} is missing)", path.display()))?;
+            let path = data_dir
+                .unwrap_or_else(|| cli::data_home().join("server"))
+                .join("token");
+            let token = std::fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "no control plane has run here yet ({} is missing)",
+                    path.display()
+                )
+            })?;
             let host = net::lan_addresses()
                 .first()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "<this-machine's-ip>".into());
-            println!("dist-alloc agent --server {host}:{} --token {}", net::DEFAULT_PORT, token.trim());
+                .map_or_else(|| "<this-machine's-ip>".into(), ToString::to_string);
+            println!(
+                "dist-alloc agent --server {host}:{} --token {}",
+                net::DEFAULT_PORT,
+                token.trim()
+            );
         }
         command => {
             let ep = cli::connect(server, token).await?;
@@ -235,23 +268,80 @@ async fn run(cli: Cli) -> Result<i32> {
                     BlobCommand::Get { hash, output } => cli::blob_get(&ep, &hash, &output).await?,
                 },
                 Command::Dataset { command } => match command {
-                    DatasetCommand::Create { name, files } => cli::dataset_create(&ep, &name, &files).await?,
+                    DatasetCommand::Create { name, files } => {
+                        cli::dataset_create(&ep, &name, &files).await?;
+                    }
                     DatasetCommand::Ls => cli::dataset_list(&ep).await?,
                 },
-                Command::Server { .. } | Command::Agent { .. } | Command::Token { .. } => unreachable!(),
+                Command::Server { .. } | Command::Agent { .. } | Command::Token { .. } => {
+                    unreachable!()
+                }
             }
         }
     }
     Ok(0)
 }
 
+/// Daemon logs go to stderr, filtered by `RUST_LOG` (default `info`); CLI results go to stdout.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_target(false)
+        .init();
+}
+
+/// Maps a job's exit status onto this process's, keeping failures non-zero.
+fn exit_code(code: i32) -> ExitCode {
+    match u8::try_from(code) {
+        Ok(code) => ExitCode::from(code),
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    init_logging();
     match run(Cli::parse()).await {
-        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Ok(code) => exit_code(code),
         Err(e) => {
-            eprintln!("error: {e:#}");
+            #[expect(
+                clippy::print_stderr,
+                reason = "the CLI's one place to report a fatal error"
+            )]
+            {
+                eprintln!("error: {e:#}");
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn job_exit_codes_pass_through_and_odd_ones_still_fail() {
+        assert_eq!(exit_code(0), ExitCode::SUCCESS);
+        assert_eq!(exit_code(3), ExitCode::from(3));
+        assert_eq!(exit_code(-1), ExitCode::FAILURE);
+        assert_eq!(exit_code(300), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn gb_converts_and_clamps_negative_sizes() {
+        assert_eq!(gb(1.0), 1 << 30);
+        assert_eq!(gb(0.5), 1 << 29);
+        assert_eq!(gb(-3.0), 0);
     }
 }

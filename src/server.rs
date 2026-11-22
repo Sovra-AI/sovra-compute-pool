@@ -24,7 +24,11 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::net::{self, Endpoint, Identity, Token, constant_time_eq};
-use crate::proto::*;
+use crate::proto::{
+    ApiError, Assignment, Blob, BlobSources, Hash, HeartbeatReq, HeartbeatResp, JobSpec, JobState,
+    JobView, LogChunk, NodeInfo, NodeStats, NodeView, PutBlobResp, RegisterReq, RegisterResp,
+    TaskState, TaskView, is_hash, safe_name,
+};
 use crate::sched::{self, NodeFree};
 use crate::store::Store;
 
@@ -131,7 +135,12 @@ impl State {
                     name: &node.name,
                     cpus: node.info.cpus,
                     memory_mb: node.info.memory_mb,
-                    gpus: node.info.gpus.iter().map(|g| (g.index, g.memory_mb)).collect(),
+                    gpus: node
+                        .info
+                        .gpus
+                        .iter()
+                        .map(|g| (g.index, g.memory_mb))
+                        .collect(),
                     labels: &node.labels,
                     blobs: node.blobs.as_ref(),
                 };
@@ -174,14 +183,14 @@ impl State {
                     job.state = JobState::Running;
                     job.started_at = Some(now());
                     job.message = None;
-                    for (rank, placement) in placements.into_iter().enumerate() {
+                    for (rank, placement) in (0u32..).zip(placements) {
                         let id = format!("{}.{}.{rank}", job.id, job.attempt);
                         self.tasks.insert(
                             id.clone(),
                             Task {
                                 id,
                                 job_id: job.id.clone(),
-                                rank: rank as u32,
+                                rank,
                                 attempt: job.attempt,
                                 node: placement.node,
                                 gpus: placement.gpus,
@@ -243,11 +252,19 @@ impl State {
         let crashed = culprit.state == TaskState::Failed;
         let what = match (&culprit.message, culprit.exit_code) {
             (Some(message), _) => format!("rank {} on {}: {message}", culprit.rank, culprit.node),
-            (None, Some(code)) => format!("rank {} on {} exited with code {code}", culprit.rank, culprit.node),
+            (None, Some(code)) => format!(
+                "rank {} on {} exited with code {code}",
+                culprit.rank, culprit.node
+            ),
             (None, None) => format!("rank {} on {} failed", culprit.rank, culprit.node),
         };
         for task in &mut tasks {
-            Self::terminate(task, TaskState::Killed, "stopped: another replica of the job failed", false);
+            Self::terminate(
+                task,
+                TaskState::Killed,
+                "stopped: another replica of the job failed",
+                false,
+            );
         }
 
         if crashed && job.retries_used >= job.spec.max_retries {
@@ -326,7 +343,12 @@ impl State {
             inputs: job.spec.inputs_for_rank(task.rank),
             peer_hosts: gang
                 .iter()
-                .map(|t| self.nodes.get(&t.node).map(|n| n.host.clone()).unwrap_or_default())
+                .map(|t| {
+                    self.nodes
+                        .get(&t.node)
+                        .map(|n| n.host.clone())
+                        .unwrap_or_default()
+                })
                 .collect(),
         }
     }
@@ -432,7 +454,7 @@ impl State {
             .map(Node::blob_addr)
             .collect();
         if !peers.is_empty() {
-            let start = rand::random::<u64>() as usize % peers.len();
+            let start = rand::random_range(0..peers.len());
             peers.rotate_left(start);
         }
         peers
@@ -514,20 +536,20 @@ type App = Arc<Server>;
 impl Server {
     /// Runs `f` on the state and schedules a save.
     fn update<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
-        let result = f(&mut self.state.lock().unwrap());
+        let result = f(&mut crate::lock(&self.state));
         self.dirty.store(true, Ordering::SeqCst);
         result
     }
 
     fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {
-        f(&self.state.lock().unwrap())
+        f(&crate::lock(&self.state))
     }
 
     fn save(&self) -> std::io::Result<()> {
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
-        let json = serde_json::to_vec(&*self.state.lock().unwrap())?;
+        let json = serde_json::to_vec(&*crate::lock(&self.state))?;
         let tmp = self.state_path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
         std::fs::rename(tmp, &self.state_path)
@@ -542,7 +564,14 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
     let identity = Identity::load_or_create(dir)?;
     let token_path = dir.join("token");
     let token = match std::fs::read_to_string(&token_path) {
-        Ok(raw) => Token::parse(&raw)?,
+        Ok(raw) => {
+            Token::parse(&raw).with_context(|| format!("{} is corrupt", token_path.display()))?
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            // Never mint a new token over an unreadable one: every joined device would be
+            // locked out.
+            return Err(e).with_context(|| format!("reading {}", token_path.display()));
+        }
         Err(_) => {
             let token = Token::generate(&identity.cert_pem);
             net::write_private(&token_path, &token.to_string())?;
@@ -554,24 +583,17 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
     let state: State = match std::fs::read(&state_path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("{} is corrupt", state_path.display()))?,
-        Err(_) => State::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
+        // Starting empty would overwrite the saved jobs and devices on the next save.
+        Err(e) => return Err(e).with_context(|| format!("reading {}", state_path.display())),
     };
-    eprintln!(
-        "dist-alloc control plane on {} — {} nodes, {} jobs known",
-        opts.listen,
-        state.nodes.len(),
-        state.jobs.len()
+    tracing::info!(
+        listen = %opts.listen,
+        nodes = state.nodes.len(),
+        jobs = state.jobs.len(),
+        "dist-alloc control plane starting"
     );
-    let reachable = net::lan_addresses();
-    let host = reachable
-        .first()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "<this-machine's-ip>".into());
-    eprintln!("\nadd a device to the pool by running on it:\n");
-    eprintln!("  dist-alloc agent --server {host}:{} --token {token}\n", opts.listen.port());
-    if reachable.len() > 1 {
-        eprintln!("(this machine is also reachable at {:?})", &reachable[1..]);
-    }
+    announce_join_command(&token, opts.listen.port());
 
     let app: App = Arc::new(Server {
         state: Mutex::new(state),
@@ -589,11 +611,11 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
-            if housekeeper.state.lock().unwrap().sweep_lost_nodes() {
+            if crate::lock(&housekeeper.state).sweep_lost_nodes() {
                 housekeeper.dirty.store(true, Ordering::SeqCst);
             }
             if let Err(e) = housekeeper.save() {
-                eprintln!("warn: saving state: {e}");
+                tracing::warn!("saving state: {e}");
             }
         }
     });
@@ -606,7 +628,10 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/jobs/{id}/logs", get(job_logs))
-        .route("/v1/blobs", put(put_blob).layer(DefaultBodyLimit::disable()))
+        .route(
+            "/v1/blobs",
+            put(put_blob).layer(DefaultBodyLimit::disable()),
+        )
         .route("/v1/blobs/{hash}", get(get_blob))
         .route("/v1/blobs/{hash}/sources", get(blob_sources))
         .route("/v1/datasets", get(list_datasets))
@@ -627,11 +652,40 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
         .serve(router.into_make_service_with_connect_info::<SocketAddr>());
     tokio::select! {
         result = serve => result.with_context(|| format!("serving on {}", opts.listen))?,
-        _ = crate::shutdown_signal() => eprintln!("shutting down"),
+        () = crate::shutdown_signal() => tracing::info!("shutting down"),
     }
     app.dirty.store(true, Ordering::SeqCst);
     app.save()?;
     Ok(())
+}
+
+/// Tells the operator how to add devices. The command embeds the cluster-admin token, so it
+/// is printed only to an interactive terminal, never into a service's log.
+fn announce_join_command(token: &Token, port: u16) {
+    use std::io::IsTerminal;
+    let reachable = net::lan_addresses();
+    if !std::io::stderr().is_terminal() {
+        tracing::info!(
+            "run `dist-alloc token` on this machine to print the join command for new devices"
+        );
+        return;
+    }
+    let host = reachable
+        .first()
+        .map_or_else(|| "<this-machine's-ip>".to_owned(), ToString::to_string);
+    let mut out = std::io::stderr().lock();
+    let _ = writeln!(out, "\nadd a device to the pool by running on it:\n");
+    let _ = writeln!(
+        out,
+        "  dist-alloc agent --server {host}:{port} --token {token}\n"
+    );
+    if reachable.len() > 1 {
+        let _ = writeln!(
+            out,
+            "(this machine is also reachable at {:?})",
+            &reachable[1..]
+        );
+    }
 }
 
 // ---------------------------------------------------------------- http plumbing
@@ -711,12 +765,13 @@ async fn register(
     let host = req
         .advertise_host
         .unwrap_or_else(|| remote.ip().to_canonical().to_string());
-    eprintln!(
-        "node {} joined from {host}: {} cpu, {} MB, {} gpu",
-        req.name,
-        req.info.cpus,
-        req.info.memory_mb,
-        req.info.gpus.len()
+    tracing::info!(
+        node = %req.name,
+        %host,
+        cpus = req.info.cpus,
+        memory_mb = req.info.memory_mb,
+        gpus = req.info.gpus.len(),
+        "node joined"
     );
     app.update(|state| {
         state.nodes.insert(
@@ -735,7 +790,7 @@ async fn register(
         state.schedule();
     });
     Ok(Json(RegisterResp {
-        heartbeat_ms: HEARTBEAT.as_millis() as u64,
+        heartbeat_ms: HEARTBEAT.as_secs() * 1000 + u64::from(HEARTBEAT.subsec_millis()),
         cert_pem: app.identity.cert_pem.clone(),
         key_pem: app.identity.key_pem.clone(),
     }))
@@ -755,9 +810,15 @@ async fn list_nodes(AxState(app): AxState<App>) -> Json<Vec<NodeView>> {
     Json(app.read(|s| s.nodes.values().map(|n| s.node_view(n)).collect()))
 }
 
-async fn remove_node(AxState(app): AxState<App>, Path(name): Path<String>) -> Result<StatusCode, Fail> {
+async fn remove_node(
+    AxState(app): AxState<App>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, Fail> {
     app.update(|state| {
-        state.nodes.remove(&name).ok_or_else(|| not_found(format!("no node {name}")))?;
+        state
+            .nodes
+            .remove(&name)
+            .ok_or_else(|| not_found(format!("no node {name}")))?;
         let mut affected = BTreeSet::new();
         for task in state.tasks.values_mut().filter(|t| t.node == name) {
             if !task.released {
@@ -774,7 +835,10 @@ async fn remove_node(AxState(app): AxState<App>, Path(name): Path<String>) -> Re
     })
 }
 
-async fn submit_job(AxState(app): AxState<App>, Json(spec): Json<JobSpec>) -> Result<Json<JobView>, Fail> {
+async fn submit_job(
+    AxState(app): AxState<App>,
+    Json(spec): Json<JobSpec>,
+) -> Result<Json<JobView>, Fail> {
     if spec.command.is_empty() {
         return Err(bad("command is empty"));
     }
@@ -787,7 +851,10 @@ async fn submit_job(AxState(app): AxState<App>, Json(spec): Json<JobSpec>) -> Re
             return Err(bad(format!("input {}: not a BLAKE3 hash", input.name)));
         }
         if !safe_name(&input.name) {
-            return Err(bad(format!("input name {:?} is not a safe relative path", input.name)));
+            return Err(bad(format!(
+                "input name {:?} is not a safe relative path",
+                input.name
+            )));
         }
         if !names.insert(&input.name) {
             return Err(bad(format!("duplicate input name {:?}", input.name)));
@@ -799,15 +866,18 @@ async fn submit_job(AxState(app): AxState<App>, Json(spec): Json<JobSpec>) -> Re
             .chain(&spec.shards)
             .find(|input| {
                 app.store.find(&input.hash).is_none()
-                    && !state
-                        .nodes
-                        .values()
-                        .any(|n| n.blobs.as_ref().is_some_and(|b| b.contains_key(&input.hash)))
+                    && !state.nodes.values().any(|n| {
+                        n.blobs
+                            .as_ref()
+                            .is_some_and(|b| b.contains_key(&input.hash))
+                    })
             })
             .map(|input| input.name.clone())
     });
     if let Some(name) = missing {
-        return Err(bad(format!("input {name}: no node holds that blob; upload it first")));
+        return Err(bad(format!(
+            "input {name}: no node holds that blob; upload it first"
+        )));
     }
 
     Ok(Json(app.update(|state| {
@@ -839,12 +909,18 @@ async fn list_jobs(AxState(app): AxState<App>) -> Json<Vec<JobView>> {
     }))
 }
 
-async fn get_job(AxState(app): AxState<App>, Path(id): Path<String>) -> Result<Json<JobView>, Fail> {
+async fn get_job(
+    AxState(app): AxState<App>,
+    Path(id): Path<String>,
+) -> Result<Json<JobView>, Fail> {
     app.read(|s| s.jobs.get(&id).map(|j| Json(s.job_view(j))))
         .ok_or_else(|| not_found(format!("no job {id}")))
 }
 
-async fn cancel_job(AxState(app): AxState<App>, Path(id): Path<String>) -> Result<Json<JobView>, Fail> {
+async fn cancel_job(
+    AxState(app): AxState<App>,
+    Path(id): Path<String>,
+) -> Result<Json<JobView>, Fail> {
     app.update(|state| {
         if !state.cancel(&id) {
             return Err(not_found(format!("no job {id}")));
@@ -952,8 +1028,14 @@ async fn put_dataset(
     if files.is_empty() {
         return Err(bad("a dataset needs at least one file"));
     }
-    if let Some(file) = files.iter().find(|f| !is_hash(&f.hash) || !safe_name(&f.name)) {
-        return Err(bad(format!("dataset file {:?} has an invalid name or hash", file.name)));
+    if let Some(file) = files
+        .iter()
+        .find(|f| !is_hash(&f.hash) || !safe_name(&f.name))
+    {
+        return Err(bad(format!(
+            "dataset file {:?} has an invalid name or hash",
+            file.name
+        )));
     }
     app.update(|state| state.datasets.insert(name, files));
     Ok(StatusCode::NO_CONTENT)
@@ -962,13 +1044,19 @@ async fn put_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{GpuInfo, Resources, TaskReport};
 
     fn spec(replicas: u32, gpus: u32, max_retries: u32) -> JobSpec {
         JobSpec {
             name: "t".into(),
             command: vec!["true".into()],
             env: BTreeMap::new(),
-            resources: Resources { cpus: 1, memory_mb: 100, gpus, gpu_memory_mb: 0 },
+            resources: Resources {
+                cpus: 1,
+                memory_mb: 100,
+                gpus,
+                gpu_memory_mb: 0,
+            },
             replicas,
             inputs: Vec::new(),
             shards: Vec::new(),
@@ -979,6 +1067,8 @@ mod tests {
     }
 
     fn cluster(nodes: &[&str]) -> (State, PathBuf) {
+        // Tests run in parallel and task ids repeat across them, so each gets its own logs.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let mut state = State::default();
         for name in nodes {
             state.nodes.insert(
@@ -990,7 +1080,12 @@ mod tests {
                     info: NodeInfo {
                         cpus: 4,
                         memory_mb: 1000,
-                        gpus: vec![GpuInfo { index: 0, uuid: "GPU-x".into(), name: "T".into(), memory_mb: 8000 }],
+                        gpus: vec![GpuInfo {
+                            index: 0,
+                            uuid: "GPU-x".into(),
+                            name: "T".into(),
+                            memory_mb: 8000,
+                        }],
                         ..Default::default()
                     },
                     labels: BTreeMap::new(),
@@ -1000,7 +1095,11 @@ mod tests {
                 },
             );
         }
-        let logs = std::env::temp_dir().join(format!("da-server-test-{}-{}", std::process::id(), nodes.len()));
+        let logs = std::env::temp_dir().join(format!(
+            "da-server-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
         std::fs::create_dir_all(&logs).unwrap();
         (state, logs)
     }
@@ -1027,7 +1126,12 @@ mod tests {
         id
     }
 
-    fn beat(state: &mut State, logs: &FsPath, node: &str, tasks: &[(&str, TaskState, Option<i32>)]) -> HeartbeatResp {
+    fn beat(
+        state: &mut State,
+        logs: &FsPath,
+        node: &str,
+        tasks: &[(&str, TaskState, Option<i32>)],
+    ) -> HeartbeatResp {
         let req = HeartbeatReq {
             stats: NodeStats::default(),
             blobs: None,
@@ -1046,7 +1150,9 @@ mod tests {
                 })
                 .collect(),
         };
-        state.heartbeat(node, req, logs).expect("node is registered")
+        state
+            .heartbeat(node, req, logs)
+            .expect("node is registered")
     }
 
     #[test]
@@ -1055,7 +1161,11 @@ mod tests {
         let job = submit(&mut state, spec(1, 1, 0));
         let waiting = submit(&mut state, spec(1, 1, 0));
         assert_eq!(state.jobs[&job].state, JobState::Running);
-        assert_eq!(state.jobs[&waiting].state, JobState::Queued, "the only GPU is taken");
+        assert_eq!(
+            state.jobs[&waiting].state,
+            JobState::Queued,
+            "the only GPU is taken"
+        );
 
         let resp = beat(&mut state, &logs, "a", &[]);
         assert_eq!(resp.assign.len(), 1);
@@ -1065,11 +1175,24 @@ mod tests {
         let resp = beat(&mut state, &logs, "a", &[(&task, TaskState::Running, None)]);
         assert!(resp.assign.is_empty(), "not redelivered once acknowledged");
 
-        let resp = beat(&mut state, &logs, "a", &[(&task, TaskState::Succeeded, Some(0))]);
+        let resp = beat(
+            &mut state,
+            &logs,
+            "a",
+            &[(&task, TaskState::Succeeded, Some(0))],
+        );
         assert_eq!(resp.forget, [task]);
         assert_eq!(state.jobs[&job].state, JobState::Succeeded);
-        assert_eq!(state.jobs[&waiting].state, JobState::Running, "freed GPU went to the next job");
-        assert_eq!(resp.assign.len(), 1, "and it is delivered in the same heartbeat");
+        assert_eq!(
+            state.jobs[&waiting].state,
+            JobState::Running,
+            "freed GPU went to the next job"
+        );
+        assert_eq!(
+            resp.assign.len(),
+            1,
+            "and it is delivered in the same heartbeat"
+        );
     }
 
     #[test]
@@ -1081,24 +1204,48 @@ mod tests {
         beat(&mut state, &logs, "b", &[(&on_b, TaskState::Running, None)]);
 
         // Rank on `a` crashes: its sibling must be stopped before the GPU is reused.
-        beat(&mut state, &logs, "a", &[(&on_a, TaskState::Failed, Some(3))]);
+        beat(
+            &mut state,
+            &logs,
+            "a",
+            &[(&on_a, TaskState::Failed, Some(3))],
+        );
         assert_eq!(state.jobs[&job].state, JobState::Queued);
         assert_eq!(state.jobs[&job].attempt, 2);
         assert_eq!(state.tasks[&on_b].state, TaskState::Killed);
         let resp = beat(&mut state, &logs, "b", &[(&on_b, TaskState::Running, None)]);
         assert_eq!(resp.kill, std::slice::from_ref(&on_b));
-        assert_eq!(state.jobs[&job].state, JobState::Queued, "b's GPU is still held by the dying task");
+        assert_eq!(
+            state.jobs[&job].state,
+            JobState::Queued,
+            "b's GPU is still held by the dying task"
+        );
 
         let resp = beat(&mut state, &logs, "b", &[(&on_b, TaskState::Killed, None)]);
-        assert_eq!(state.jobs[&job].state, JobState::Running, "second attempt placed");
+        assert_eq!(
+            state.jobs[&job].state,
+            JobState::Running,
+            "second attempt placed"
+        );
         let retry_b = resp.assign[0].task_id.clone();
         let retry_a = beat(&mut state, &logs, "a", &[]).assign[0].task_id.clone();
         assert_ne!(retry_a, on_a);
 
         // Out of retries now.
-        beat(&mut state, &logs, "a", &[(&retry_a, TaskState::Failed, Some(3))]);
+        beat(
+            &mut state,
+            &logs,
+            "a",
+            &[(&retry_a, TaskState::Failed, Some(3))],
+        );
         assert_eq!(state.jobs[&job].state, JobState::Failed);
-        assert!(state.jobs[&job].message.as_deref().unwrap().contains("exited with code 3"));
+        assert!(
+            state.jobs[&job]
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("exited with code 3")
+        );
         assert_eq!(state.tasks[&retry_b].state, TaskState::Killed);
     }
 
@@ -1107,26 +1254,115 @@ mod tests {
         let (mut state, logs) = cluster(&["a", "b"]);
         let job = submit(&mut state, spec(1, 0, 0));
         let node = state.tasks.values().next().unwrap().node.clone();
-        let task = beat(&mut state, &logs, &node, &[]).assign[0].task_id.clone();
-        beat(&mut state, &logs, &node, &[(&task, TaskState::Running, None)]);
+        let task = beat(&mut state, &logs, &node, &[]).assign[0]
+            .task_id
+            .clone();
+        beat(
+            &mut state,
+            &logs,
+            &node,
+            &[(&task, TaskState::Running, None)],
+        );
 
-        state.nodes.get_mut(&node).unwrap().last_seen = Instant::now() - NODE_TIMEOUT - Duration::from_secs(1);
+        state.nodes.get_mut(&node).unwrap().last_seen = Instant::now()
+            .checked_sub(NODE_TIMEOUT + Duration::from_secs(1))
+            .unwrap();
         assert!(state.sweep_lost_nodes());
         assert_eq!(state.tasks[&task].state, TaskState::Lost);
         let job_ref = &state.jobs[&job];
-        assert_eq!((job_ref.state, job_ref.attempt, job_ref.retries_used), (JobState::Running, 2, 0));
+        assert_eq!(
+            (job_ref.state, job_ref.attempt, job_ref.retries_used),
+            (JobState::Running, 2, 0)
+        );
         let survivor = if node == "a" { "b" } else { "a" };
-        let moved = beat(&mut state, &logs, survivor, &[]).assign[0].task_id.clone();
+        let moved = beat(&mut state, &logs, survivor, &[]).assign[0]
+            .task_id
+            .clone();
 
         // The lost node comes back still running the old task: it is told to stop it.
         state.nodes.get_mut(&node).unwrap().last_seen = Instant::now();
-        let resp = beat(&mut state, &logs, &node, &[(&task, TaskState::Running, None)]);
+        let resp = beat(
+            &mut state,
+            &logs,
+            &node,
+            &[(&task, TaskState::Running, None)],
+        );
         assert_eq!(resp.kill, [task]);
 
-        beat(&mut state, &logs, survivor, &[(&moved, TaskState::Running, None)]);
+        beat(
+            &mut state,
+            &logs,
+            survivor,
+            &[(&moved, TaskState::Running, None)],
+        );
         assert!(state.cancel(&job));
         assert_eq!(state.jobs[&job].state, JobState::Cancelled);
-        let resp = beat(&mut state, &logs, survivor, &[(&moved, TaskState::Running, None)]);
+        let resp = beat(
+            &mut state,
+            &logs,
+            survivor,
+            &[(&moved, TaskState::Running, None)],
+        );
         assert_eq!(resp.kill, [moved]);
+    }
+
+    #[test]
+    fn higher_priority_runs_first_when_capacity_frees_up() {
+        let (mut state, logs) = cluster(&["a"]);
+        let busy = submit(&mut state, spec(1, 1, 0));
+        let low = submit(&mut state, spec(1, 1, 0));
+        let mut urgent = spec(1, 1, 0);
+        urgent.priority = 5;
+        let high = submit(&mut state, urgent);
+        assert_eq!(state.jobs[&low].state, JobState::Queued);
+        assert_eq!(state.jobs[&high].state, JobState::Queued);
+
+        let task = format!("{busy}.1.0");
+        beat(&mut state, &logs, "a", &[(&task, TaskState::Running, None)]);
+        beat(
+            &mut state,
+            &logs,
+            "a",
+            &[(&task, TaskState::Succeeded, Some(0))],
+        );
+        assert_eq!(state.jobs[&busy].state, JobState::Succeeded);
+        assert_eq!(
+            state.jobs[&high].state,
+            JobState::Running,
+            "priority 5 goes first"
+        );
+        assert_eq!(state.jobs[&low].state, JobState::Queued);
+    }
+
+    #[test]
+    fn a_job_that_cannot_fit_does_not_block_smaller_ones() {
+        let (mut state, _logs) = cluster(&["a"]);
+        let big = submit(&mut state, spec(2, 1, 0));
+        let small = submit(&mut state, spec(1, 0, 0));
+        assert_eq!(state.jobs[&big].state, JobState::Queued);
+        let why = state.jobs[&big].message.clone().unwrap_or_default();
+        assert!(why.contains("1 of 2 replicas fit"), "{why}");
+        assert_eq!(state.jobs[&small].state, JobState::Running);
+    }
+
+    #[test]
+    fn saved_state_round_trips_and_restarted_nodes_get_a_grace_period() {
+        let (mut state, _logs) = cluster(&["a", "b"]);
+        let job = submit(&mut state, spec(2, 1, 0));
+        let json = serde_json::to_vec(&state).unwrap();
+        let restored: State = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.jobs[&job].state, JobState::Running);
+        assert_eq!(restored.tasks.len(), 2);
+        assert_eq!(restored.next_job, state.next_job);
+        assert!(restored.nodes.values().all(Node::ready));
+    }
+
+    #[test]
+    fn ipv6_hosts_get_brackets_in_blob_addresses() {
+        let (mut state, _logs) = cluster(&["a"]);
+        let node = state.nodes.get_mut("a").unwrap();
+        assert_eq!(node.blob_addr(), "10.0.0.1:1");
+        node.host = "fd00::7".into();
+        assert_eq!(node.blob_addr(), "[fd00::7]:1");
     }
 }

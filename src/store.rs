@@ -55,7 +55,7 @@ impl Store {
             pins: Mutex::default(),
             version: AtomicU64::new(1),
             tmp_seq: AtomicU64::new(0),
-            fetching: Default::default(),
+            fetching: tokio::sync::Mutex::default(),
         };
         // Anything left in tmp/ is a write that never completed.
         let _ = std::fs::remove_dir_all(&store.tmp);
@@ -106,11 +106,11 @@ impl Store {
     }
 
     pub fn pin(&self, hash: &str) {
-        *self.pins.lock().unwrap().entry(hash.to_owned()).or_default() += 1;
+        *crate::lock(&self.pins).entry(hash.to_owned()).or_default() += 1;
     }
 
     pub fn unpin(&self, hash: &str) {
-        let mut pins = self.pins.lock().unwrap();
+        let mut pins = crate::lock(&self.pins);
         if let Some(count) = pins.get_mut(hash) {
             *count -= 1;
             if *count == 0 {
@@ -122,20 +122,24 @@ impl Store {
     /// Serialises concurrent fetches of the same blob. Hold the returned guard while
     /// downloading, and re-check [`Store::find`] after acquiring it.
     pub async fn fetch_lock(&self, hash: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = self
-            .fetching
-            .lock()
-            .await
-            .entry(hash.to_owned())
-            .or_default()
-            .clone();
+        let lock = {
+            let mut fetching = self.fetching.lock().await;
+            // Forget locks nobody holds or waits for, so the map tracks only live fetches.
+            fetching.retain(|_, lock| Arc::strong_count(lock) > 1);
+            fetching.entry(hash.to_owned()).or_default().clone()
+        };
         lock.lock_owned().await
+    }
+
+    /// A fresh, unused path under `tmp/`.
+    fn tmp_path(&self) -> PathBuf {
+        let seq = self.tmp_seq.fetch_add(1, Ordering::SeqCst);
+        self.tmp.join(format!("{}-{seq}", std::process::id()))
     }
 
     /// Starts writing a blob. `keep` stores it where the garbage collector never looks.
     pub async fn writer(&self, keep: bool) -> io::Result<BlobWriter<'_>> {
-        let seq = self.tmp_seq.fetch_add(1, Ordering::SeqCst);
-        let path = self.tmp.join(format!("{}-{seq}", std::process::id()));
+        let path = self.tmp_path();
         Ok(BlobWriter {
             store: self,
             file: tokio::fs::File::create(&path).await?,
@@ -154,8 +158,14 @@ impl Store {
             .map_err(io::Error::other)??;
         let target = self.kept.join(&hash);
         if tokio::fs::rename(file, &target).await.is_err() {
-            // Different filesystem.
-            tokio::fs::copy(file, &target).await?;
+            // Different filesystem: copy beside the store first, so a crash mid-copy never
+            // leaves a truncated file under the hash name.
+            let staging = self.tmp_path();
+            if let Err(e) = tokio::fs::copy(file, &staging).await {
+                let _ = tokio::fs::remove_file(&staging).await;
+                return Err(e);
+            }
+            tokio::fs::rename(&staging, &target).await?;
             let _ = tokio::fs::remove_file(file).await;
         }
         self.version.fetch_add(1, Ordering::SeqCst);
@@ -183,7 +193,7 @@ impl Store {
         if need == 0 {
             return Ok((0, 0));
         }
-        let pinned: HashSet<Hash> = self.pins.lock().unwrap().keys().cloned().collect();
+        let pinned: HashSet<Hash> = crate::lock(&self.pins).keys().cloned().collect();
         let victims = plan_eviction(&entries, need, &pinned, policy.min_age, SystemTime::now());
         let mut freed = (0, 0);
         for victim in victims {
@@ -258,19 +268,8 @@ pub fn hash_file(path: &Path) -> io::Result<(Hash, u64)> {
 
 /// Bytes available to unprivileged writers on the filesystem holding `dir`.
 pub fn free_bytes(dir: &Path) -> io::Result<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: c_path is NUL-terminated and vfs is writable storage that statvfs fully
-    // initialises when it returns 0.
-    let vfs = unsafe {
-        if libc::statvfs(c_path.as_ptr(), vfs.as_mut_ptr()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        vfs.assume_init()
-    };
-    Ok(vfs.f_bavail as u64 * vfs.f_frsize as u64)
+    let vfs = nix::sys::statvfs::statvfs(dir).map_err(io::Error::from)?;
+    Ok(vfs.blocks_available().saturating_mul(vfs.fragment_size()))
 }
 
 /// How much cache to evict: nothing while within quota and above the free-space floor;
@@ -345,7 +344,10 @@ mod tests {
         assert_eq!(bytes_to_free(110 * GB, 50 * GB, &policy), 30 * GB);
         // Disk nearly full: restore 125% of the floor.
         assert_eq!(bytes_to_free(20 * GB, 4 * GB, &policy), 8 * GB + GB / 2);
-        let unlimited = GcPolicy { max_bytes: None, ..policy };
+        let unlimited = GcPolicy {
+            max_bytes: None,
+            ..policy
+        };
         assert_eq!(bytes_to_free(900 * GB, 11 * GB, &unlimited), 0);
     }
 
@@ -369,6 +371,77 @@ mod tests {
         assert!(plan_eviction(&entries, 0, &none, Duration::ZERO, now).is_empty());
     }
 
+    #[test]
+    fn eviction_stops_once_enough_is_planned_and_skips_future_mtimes() {
+        let now = SystemTime::now();
+        let future = CacheEntry {
+            hash: "f".repeat(64),
+            size: GB,
+            mtime: now + Duration::from_secs(3600),
+        };
+        let entries = [
+            entry('a', 4 * GB, 300, now),
+            entry('b', 4 * GB, 200, now),
+            future,
+        ];
+        let none = HashSet::new();
+        assert_eq!(
+            tags(&plan_eviction(&entries, 4 * GB, &none, Duration::ZERO, now)),
+            "a"
+        );
+        assert_eq!(
+            tags(&plan_eviction(
+                &entries,
+                4 * GB + 1,
+                &none,
+                Duration::ZERO,
+                now
+            )),
+            "ab"
+        );
+        // A clock skewed into the future never makes a blob look old.
+        assert_eq!(
+            tags(&plan_eviction(
+                &entries,
+                100 * GB,
+                &none,
+                Duration::ZERO,
+                now
+            )),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn floor_and_quota_together_free_the_larger_amount() {
+        let policy = GcPolicy {
+            max_bytes: Some(10 * GB),
+            min_free_bytes: 8 * GB,
+            min_age: Duration::ZERO,
+        };
+        // Quota wants 12 - 8 = 4 GB; disk wants 10 - 1 = 9 GB.
+        assert_eq!(bytes_to_free(12 * GB, GB, &policy), 9 * GB);
+    }
+
+    #[tokio::test]
+    async fn concurrent_fetch_locks_for_one_blob_are_exclusive_and_then_forgotten() {
+        let root = std::env::temp_dir().join(format!("da-store-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let first = store.fetch_lock("x").await;
+        let second = tokio::time::timeout(Duration::from_millis(50), store.fetch_lock("x")).await;
+        assert!(second.is_err(), "a second fetch of the same blob waits");
+        drop(first);
+        drop(store.fetch_lock("y").await);
+        let _ = store.fetch_lock("z").await;
+        assert_eq!(
+            store.fetching.lock().await.len(),
+            1,
+            "only the newest lock is tracked"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[tokio::test]
     async fn writes_verify_content_and_gc_respects_pins() {
         let root = std::env::temp_dir().join(format!("da-store-test-{}", std::process::id()));
@@ -381,7 +454,10 @@ mod tests {
         let (hash, size) = w.finish(None).await.unwrap();
         assert_eq!(hash, blake3::hash(b"hello world").to_hex().to_string());
         assert_eq!(size, 11);
-        assert_eq!(std::fs::read(store.find(&hash).unwrap()).unwrap(), b"hello world");
+        assert_eq!(
+            std::fs::read(store.find(&hash).unwrap()).unwrap(),
+            b"hello world"
+        );
 
         // A corrupted transfer is rejected and leaves nothing behind.
         let mut w = store.writer(false).await.unwrap();
@@ -406,6 +482,11 @@ mod tests {
         assert!(store.find(&hash).is_none());
         assert!(store.find(&kept).is_some());
         assert!(store.find("../../etc/passwd").is_none());
+
+        // Adopting the same content twice keeps one copy.
+        std::fs::write(&out, b"weights").unwrap();
+        assert_eq!(store.adopt(&out).await.unwrap().0, kept);
+        assert!(!out.exists());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
