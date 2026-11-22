@@ -1,0 +1,45 @@
+# Changelog
+
+All notable changes to this project are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-11-22
+
+First public release, as an official Sovra plugin.
+
+### Added
+
+- Sovra and Claude Code plugin: four skills — **Start a computer pool**, **Add a computer
+  to my pool**, **Run a job on my computer pool** and **Check on my computer pool** — that
+  set up and drive the pool through the assistant's approved terminal commands.
+- `dist-alloc service install|uninstall server|agent`: run the control plane or an agent as
+  a systemd user service that survives logout (with lingering) and reboots.
+- `dist-alloc token --write FILE [--host ADDRESS]`: an owner-only invite file for joining a
+  device without typing or pasting the token. `service install agent --invite FILE` uses it.
+- The CLI finds the pool by itself on any computer whose agent was installed as a service.
+- Release archives for x86_64 and arm64 Linux, each with a SHA-256 checksum.
+- MIT licence, CI (format, lints, tests, cargo-deny, shellcheck, Sovra plugin check).
+
+### Changed
+
+- Logs use `tracing` (filter with `RUST_LOG`) and carry structured fields.
+- The control plane prints the join command only to an interactive terminal, never into a
+  service log; `dist-alloc token` shows it on demand.
+- Job processes no longer inherit the agent's `DA_TOKEN`.
+- Join addresses skip container and VM bridges (`docker0`, `virbr0`, …) and down links.
+
+### Fixed
+
+- An unreadable `state.json` or token file, or a half-present cluster identity, now stops
+  the control plane with a clear error instead of silently replacing them (which lost
+  saved jobs or locked every device out).
+- Bare and bracketed IPv6 control-plane addresses (`::1`, `[fe80::1]`) resolve correctly.
+- A job output copied across filesystems can no longer appear truncated after a crash.
+- The agent's per-blob fetch locks no longer accumulate forever.
+- A panic in one request no longer poisons shared state for the rest of the process.
+
+[Unreleased]: https://github.com/Sovra-AI/sovra-compute-pool/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Sovra-AI/sovra-compute-pool/releases/tag/v0.1.0
