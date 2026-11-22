@@ -160,7 +160,8 @@ pub fn install(role: Role, join: Option<(String, Token)>, args: &[String]) -> Re
             Some(path)
         }
         (Role::Agent, None) => bail!(
-            "an agent needs to know which pool to join: pass --invite FILE, or --server and --token"
+            "an agent needs to know which pool to join: pass --invite FILE (from `dist-alloc token \
+             --write FILE` on the pool's main computer), or --server and --token"
         ),
     };
     let unit = unit_path(role)?;

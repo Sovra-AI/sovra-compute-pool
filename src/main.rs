@@ -88,6 +88,9 @@ enum Command {
         /// the new device and run `dist-alloc service install agent --invite FILE` there.
         #[arg(long, value_name = "FILE")]
         write: Option<PathBuf>,
+        /// Address new devices should dial [default: this machine's first LAN address]
+        #[arg(long, value_name = "ADDRESS")]
+        host: Option<String>,
     },
     /// Keep the control plane or this device's agent running in the background (a systemd
     /// user service that also starts after a reboot)
@@ -210,7 +213,11 @@ fn gb(value: f64) -> u64 {
 }
 
 /// `dist-alloc token`: the join command, or an invite file, for new devices.
-fn print_join(data_dir: Option<PathBuf>, write: Option<PathBuf>) -> Result<()> {
+fn print_join(
+    data_dir: Option<PathBuf>,
+    write: Option<PathBuf>,
+    host: Option<String>,
+) -> Result<()> {
     let dir = data_dir.unwrap_or_else(|| cli::data_home().join("server"));
     let path = dir.join("token");
     let raw = std::fs::read_to_string(&path).with_context(|| {
@@ -221,9 +228,11 @@ fn print_join(data_dir: Option<PathBuf>, write: Option<PathBuf>) -> Result<()> {
     })?;
     let token = net::Token::parse(&raw)?;
     let port = server::saved_port(&dir).unwrap_or(net::DEFAULT_PORT);
-    let host = net::lan_addresses()
-        .first()
-        .map_or_else(|| "<this-machine's-ip>".into(), ToString::to_string);
+    let host = host.unwrap_or_else(|| {
+        net::lan_addresses()
+            .first()
+            .map_or_else(|| "<this-machine's-ip>".into(), ToString::to_string)
+    });
     match write {
         Some(file) => {
             net::write_private(&file, &service::invite(&format!("{host}:{port}"), &token))
@@ -236,6 +245,14 @@ fn print_join(data_dir: Option<PathBuf>, write: Option<PathBuf>) -> Result<()> {
         None => println!("dist-alloc agent --server {host}:{port} --token {token}"),
     }
     Ok(())
+}
+
+/// How an agent on the control-plane machine reaches it, if a control plane has run here.
+fn local_join() -> Option<(String, net::Token)> {
+    let dir = cli::data_home().join("server");
+    let token = net::Token::parse(&std::fs::read_to_string(dir.join("token")).ok()?).ok()?;
+    let port = server::saved_port(&dir).unwrap_or(net::DEFAULT_PORT);
+    Some((format!("127.0.0.1:{port}"), token))
 }
 
 /// `dist-alloc service`: install or remove the background service.
@@ -252,6 +269,8 @@ fn manage_service(
                         .with_context(|| format!("reading {}", file.display()))?,
                 )?),
                 (None, Some(server), Some(token)) => Some((server, net::Token::parse(&token)?)),
+                // On the control-plane machine itself, offer its own capacity to its own pool.
+                (None, None, None) => local_join(),
                 (None, _, _) => None,
             };
             service::install(role, join, &args)?;
@@ -306,7 +325,11 @@ async fn run(cli: Cli) -> Result<i32> {
             })
             .await?;
         }
-        Command::Token { data_dir, write } => print_join(data_dir, write)?,
+        Command::Token {
+            data_dir,
+            write,
+            host,
+        } => print_join(data_dir, write, host)?,
         Command::Service { command } => manage_service(command, server, token)?,
         command => {
             let ep = cli::connect(server, token).await?;
