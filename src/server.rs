@@ -593,6 +593,9 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
         jobs = state.jobs.len(),
         "dist-alloc control plane starting"
     );
+    // `dist-alloc token` reads this to put the right port in invites.
+    std::fs::write(dir.join("port"), opts.listen.port().to_string())
+        .with_context(|| format!("writing {}", dir.join("port").display()))?;
     announce_join_command(&token, opts.listen.port());
 
     let app: App = Arc::new(Server {
@@ -657,6 +660,15 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
     app.dirty.store(true, Ordering::SeqCst);
     app.save()?;
     Ok(())
+}
+
+/// The port the control plane in `data_dir` last listened on.
+pub fn saved_port(data_dir: &FsPath) -> Option<u16> {
+    std::fs::read_to_string(data_dir.join("port"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Tells the operator how to add devices. The command embeds the cluster-admin token, so it

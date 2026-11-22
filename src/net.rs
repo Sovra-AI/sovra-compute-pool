@@ -283,6 +283,15 @@ pub async fn send_json<T: DeserializeOwned>(request: reqwest::RequestBuilder) ->
     Ok(send(request).await?.json().await?)
 }
 
+/// Bridges that container and VM managers create for guests on this machine. Their
+/// addresses are up but unreachable from other devices, so they make useless join addresses.
+fn is_host_only_bridge(name: &str) -> bool {
+    const PREFIXES: [&str; 10] = [
+        "docker", "br-", "veth", "virbr", "cni", "flannel", "cilium", "lxc", "vmnet", "podman",
+    ];
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
 /// IPv4 addresses of this machine that other devices could plausibly reach (interfaces that
 /// are up, not loopback, not point-to-point tunnels).
 pub fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
@@ -292,7 +301,9 @@ pub fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
     };
     interfaces
         .filter(|ifa| {
-            ifa.flags.contains(InterfaceFlags::IFF_UP)
+            ifa.flags
+                .contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING)
+                && !is_host_only_bridge(&ifa.interface_name)
                 && !ifa
                     .flags
                     .intersects(InterfaceFlags::IFF_LOOPBACK | InterfaceFlags::IFF_POINTOPOINT)
@@ -329,6 +340,23 @@ mod tests {
             ("[::1]:9000", "[::1]:9000"),
         ] {
             assert_eq!(with_default_port(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn container_bridges_are_not_offered_as_join_addresses() {
+        for bridge in [
+            "docker0",
+            "br-3f2a",
+            "virbr0",
+            "cni0",
+            "flannel.1",
+            "veth12ab",
+        ] {
+            assert!(is_host_only_bridge(bridge), "{bridge}");
+        }
+        for real in ["eth0", "enp5s0", "wlp2s0", "wlan0", "eno1", "pool0"] {
+            assert!(!is_host_only_bridge(real), "{real}");
         }
     }
 

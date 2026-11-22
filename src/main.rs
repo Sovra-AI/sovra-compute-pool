@@ -11,6 +11,7 @@ mod net;
 mod proto;
 mod sched;
 mod server;
+mod service;
 mod store;
 
 use std::net::SocketAddr;
@@ -83,6 +84,16 @@ enum Command {
     Token {
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Write an invite file (owner-only) instead of printing the command. Carry it to
+        /// the new device and run `dist-alloc service install agent --invite FILE` there.
+        #[arg(long, value_name = "FILE")]
+        write: Option<PathBuf>,
+    },
+    /// Keep the control plane or this device's agent running in the background (a systemd
+    /// user service that also starts after a reboot)
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     /// Show every device and what it has
     Nodes {
@@ -125,6 +136,22 @@ enum Command {
         #[command(subcommand)]
         command: DatasetCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install, enable and start the service
+    Install {
+        role: service::Role,
+        /// Invite file from `dist-alloc token --write` (agent only; or use --server/--token)
+        #[arg(long, value_name = "FILE")]
+        invite: Option<PathBuf>,
+        /// Extra options for `dist-alloc server` / `dist-alloc agent`, after `--`
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Stop and remove the service
+    Uninstall { role: service::Role },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +209,58 @@ fn gb(value: f64) -> u64 {
     (value.max(0.0) * (1u64 << 30) as f64) as u64
 }
 
+/// `dist-alloc token`: the join command, or an invite file, for new devices.
+fn print_join(data_dir: Option<PathBuf>, write: Option<PathBuf>) -> Result<()> {
+    let dir = data_dir.unwrap_or_else(|| cli::data_home().join("server"));
+    let path = dir.join("token");
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no control plane has run here yet ({} is missing)",
+            path.display()
+        )
+    })?;
+    let token = net::Token::parse(&raw)?;
+    let port = server::saved_port(&dir).unwrap_or(net::DEFAULT_PORT);
+    let host = net::lan_addresses()
+        .first()
+        .map_or_else(|| "<this-machine's-ip>".into(), ToString::to_string);
+    match write {
+        Some(file) => {
+            net::write_private(&file, &service::invite(&format!("{host}:{port}"), &token))
+                .with_context(|| format!("writing {}", file.display()))?;
+            println!(
+                "wrote an invite to {} — it is a secret: anyone holding it controls the pool",
+                file.display()
+            );
+        }
+        None => println!("dist-alloc agent --server {host}:{port} --token {token}"),
+    }
+    Ok(())
+}
+
+/// `dist-alloc service`: install or remove the background service.
+fn manage_service(
+    command: ServiceCommand,
+    server: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    match command {
+        ServiceCommand::Install { role, invite, args } => {
+            let join = match (invite, server, token) {
+                (Some(file), _, _) => Some(service::parse_invite(
+                    &std::fs::read_to_string(&file)
+                        .with_context(|| format!("reading {}", file.display()))?,
+                )?),
+                (None, Some(server), Some(token)) => Some((server, net::Token::parse(&token)?)),
+                (None, _, _) => None,
+            };
+            service::install(role, join, &args)?;
+        }
+        ServiceCommand::Uninstall { role } => service::uninstall(role)?,
+    }
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<i32> {
     let Cli {
         server,
@@ -227,25 +306,8 @@ async fn run(cli: Cli) -> Result<i32> {
             })
             .await?;
         }
-        Command::Token { data_dir } => {
-            let path = data_dir
-                .unwrap_or_else(|| cli::data_home().join("server"))
-                .join("token");
-            let token = std::fs::read_to_string(&path).with_context(|| {
-                format!(
-                    "no control plane has run here yet ({} is missing)",
-                    path.display()
-                )
-            })?;
-            let host = net::lan_addresses()
-                .first()
-                .map_or_else(|| "<this-machine's-ip>".into(), ToString::to_string);
-            println!(
-                "dist-alloc agent --server {host}:{} --token {}",
-                net::DEFAULT_PORT,
-                token.trim()
-            );
-        }
+        Command::Token { data_dir, write } => print_join(data_dir, write)?,
+        Command::Service { command } => manage_service(command, server, token)?,
         command => {
             let ep = cli::connect(server, token).await?;
             match command {
@@ -273,7 +335,10 @@ async fn run(cli: Cli) -> Result<i32> {
                     }
                     DatasetCommand::Ls => cli::dataset_list(&ep).await?,
                 },
-                Command::Server { .. } | Command::Agent { .. } | Command::Token { .. } => {
+                Command::Server { .. }
+                | Command::Agent { .. }
+                | Command::Token { .. }
+                | Command::Service { .. } => {
                     unreachable!()
                 }
             }

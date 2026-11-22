@@ -70,22 +70,28 @@ pub fn data_home() -> PathBuf {
         .join("dist-alloc")
 }
 
-/// Connects using `--server/--token`, falling back to the control plane on this machine.
+/// Connects using `--server/--token`; else to the control plane on this machine; else to
+/// the pool this machine's agent service joined.
 pub async fn connect(server: Option<String>, token: Option<String>) -> Result<Endpoint> {
-    let token = if let Some(token) = token {
-        token
+    let (server, token) = if let Some(token) = token {
+        let server = server.unwrap_or_else(|| format!("127.0.0.1:{}", net::DEFAULT_PORT));
+        (server, Token::parse(&token)?)
     } else {
-        let path = data_home().join("server/token");
-        std::fs::read_to_string(&path).map_err(|_| {
-            anyhow!(
-                "no token: pass --token, set DA_TOKEN, or run this on the control-plane machine"
+        let local = data_home().join("server");
+        if let Ok(raw) = std::fs::read_to_string(local.join("token")) {
+            let port = crate::server::saved_port(&local).unwrap_or(net::DEFAULT_PORT);
+            (
+                server.unwrap_or_else(|| format!("127.0.0.1:{port}")),
+                Token::parse(&raw)?,
             )
-        })?
+        } else if let Ok(text) = std::fs::read_to_string(crate::service::agent_env_path()?) {
+            let (joined, token) = crate::service::parse_invite(&text)?;
+            (server.unwrap_or(joined), token)
+        } else {
+            bail!("no token: pass --token, set DA_TOKEN, or run this on a computer in the pool")
+        }
     };
-    let server = server.unwrap_or_else(|| format!("127.0.0.1:{}", net::DEFAULT_PORT));
-    Ok(Endpoint::bootstrap(&server, &Token::parse(&token)?)
-        .await?
-        .0)
+    Ok(Endpoint::bootstrap(&server, &token).await?.0)
 }
 
 pub fn key_values(pairs: &[String], what: &str) -> Result<BTreeMap<String, String>> {
