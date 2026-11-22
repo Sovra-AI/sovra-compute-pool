@@ -230,17 +230,20 @@ fi
 log "installing the control plane"
 curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${K3S_VERSION:-} sh -s - server
 apply_changes
-K="k3s kubectl"
+K=(k3s kubectl)
 
 wait_for() { # wait_for <seconds> <description> <command...>
   local deadline=$((SECONDS + $1)) what=$2
   shift 2
   until "$@" >/dev/null 2>&1; do
-    if ((SECONDS > deadline)); then return 1; fi
+    if ((SECONDS > deadline)); then
+      echo "timed out waiting for $what" >&2
+      return 1
+    fi
     sleep 3
   done
 }
-wait_for 180 api $K get --raw /readyz || die "the Kubernetes API did not come up; see: journalctl -u k3s"
+wait_for 180 api "${K[@]}" get --raw /readyz || die "the Kubernetes API did not come up; see: journalctl -u k3s"
 
 # K3s applies everything in this directory and keeps it applied. It creates the directory
 # itself only some time after the API answers, so make sure it is there.
@@ -252,9 +255,9 @@ done
 
 log "waiting for the GUI to start (first run downloads images)"
 GUI_READY=true
-wait_for 300 gui $K -n headlamp rollout status deployment/headlamp --timeout=5s || GUI_READY=false
-wait_for 60 token $K -n headlamp get secret headlamp-admin-token -o jsonpath='{.data.token}' || true
-GUI_TOKEN=$($K -n headlamp get secret headlamp-admin-token -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+wait_for 300 gui "${K[@]}" -n headlamp rollout status deployment/headlamp --timeout=5s || GUI_READY=false
+wait_for 60 token "${K[@]}" -n headlamp get secret headlamp-admin-token -o jsonpath='{.data.token}' || true
+GUI_TOKEN=$("${K[@]}" -n headlamp get secret headlamp-admin-token -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
 
 # kubectl for the person who ran this.
 KUBECONFIG_NOTE=""
@@ -288,7 +291,7 @@ if [[ -n ${SUDO_USER:-} ]]; then chown "$SUDO_USER" "$JOIN"; fi
 
 echo
 log "control plane is up"
-$K get nodes -o custom-columns='NODE:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory,GPU:.status.allocatable.nvidia\.com/gpu'
+"${K[@]}" get nodes -o custom-columns='NODE:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory,GPU:.status.allocatable.nvidia\.com/gpu'
 echo
 GUI_IP=${LAN_IP:-$NODE_IP}
 # The login token is an admin secret: it goes to a private file, not the terminal or logs.
