@@ -1,0 +1,9 @@
+{
+  "name": "sovra-compute-pool",
+  "version": "0.1.0",
+  "description": "Pool the computers you already have — their processors, memory and graphics cards — and run big jobs, such as training AI models, across all of them at once.",
+  "homepage": "https://github.com/Sovra-AI/sovra-compute-pool",
+  "repository": "https://github.com/Sovra-AI/sovra-compute-pool",
+  "license": "MIT",
+  "keywords": ["sovra", "distributed-computing", "gpu", "machine-learning"]
+}

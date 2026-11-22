@@ -1,0 +1,13 @@
+{
+  "name": "sovra-compute-pool",
+  "owner": {
+    "name": "Sovra-AI"
+  },
+  "plugins": [
+    {
+      "name": "sovra-compute-pool",
+      "source": "./",
+      "description": "Pool the computers you already have — their processors, memory and graphics cards — and run big jobs, such as training AI models, across all of them at once."
+    }
+  ]
+}
