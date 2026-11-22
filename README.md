@@ -28,6 +28,7 @@ paste `Sovra-AI/sovra-compute-pool` into **Add from GitHub**). Then just ask, in
 | "Add my gaming PC to my computer pool so its graphics card can help" | **Add a computer to my pool**: makes an invite file here, joins the other computer with it |
 | "Run my train.py on two of the pool's graphics cards and bring back the trained model" | **Run a job on my computer pool**: sends the files, runs the job, fetches the results |
 | "How is my computer pool doing, and is my training job finished yet?" | **Check on my computer pool**: computers, jobs, logs and fixes for common problems |
+| "Help me take the pool down and keep my job results" | **Take down a computer pool** walks through each affected computer, its services, saved data and settings. [Cleanup guide](skills/uninstall-plugin/SKILL.md) |
 
 Sovra runs each command through its terminal tool, so you see and approve every command
 before it runs. The skills live in [`skills/`](skills); nothing in this repository runs
