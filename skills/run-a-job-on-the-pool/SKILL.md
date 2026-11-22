@@ -82,3 +82,11 @@ hash. Fetch each one where the person wants it:
 
 If it failed, read `dist-alloc logs ID` and the NOTE column of `dist-alloc job ID`, explain
 the cause in plain words, and offer a fix. To stop a job: `dist-alloc cancel ID`.
+
+## Always finish with a plain message
+
+Your last message must be words to the person, never a tool call. After the last command
+has run, say in two or three plain sentences what you did and whether it worked, then list
+what they can do next, one short line each. Never end the turn on a command's output: a
+list of terminal cards with no words leaves people not knowing whether it worked or what
+to do now.

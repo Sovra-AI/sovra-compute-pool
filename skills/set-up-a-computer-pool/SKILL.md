@@ -73,14 +73,35 @@ local network address (for example `192.168.1.20`).
 - Suggest giving this computer a fixed address in their router (a "DHCP reservation"):
   invites contain the address, so computers lose the pool if it changes.
 
-## 5. What next
+## 5. Finish: say what is ready and what to do next
 
-Tell the person, in one or two sentences, that they can now:
+This step is required, and it is your last message. Write it as plain words, not a
+command. For example:
 
-- add another computer (the "Add a computer to my pool" skill makes an invite file for it),
-- run work on the pool ("Run a job on my computer pool"),
-- ask how the pool is doing ("Check on my computer pool").
+> Your computer pool is running. This computer is its main computer and has joined it,
+> so the pool has 16 processor cores, 61 GB of memory and one RTX 2080 Ti graphics card.
+> It starts again by itself after a restart.
+>
+> What you can do next:
+> - **Add another computer:** say "add my other computer to the pool" and I'll make an
+>   invite for it.
+> - **Run something on it:** say "run my training script on the pool".
+> - **Check on it:** say "how is my pool doing?"
+
+Use the real numbers from `dist-alloc nodes`. Mention a firewall or address problem from
+step 4 if there was one. If the person asks how this relates to Sovra's **Training** page,
+explain that they are separate: Training teaches Sovra's own small models with their group,
+and the pool runs programs they choose (for example their own PyTorch training script) on
+their computers. Training does not use the pool.
 
 To take the pool down later: `~/.local/bin/dist-alloc service uninstall agent` and
 `~/.local/bin/dist-alloc service uninstall server`. Its saved state stays in
 `~/.local/share/dist-alloc/` so it can be started again with the same devices.
+
+## Always finish with a plain message
+
+Your last message must be words to the person, never a tool call. After the last command
+has run, say in two or three plain sentences what you did and whether it worked, then list
+what they can do next, one short line each. Never end the turn on a command's output: a
+list of terminal cards with no words leaves people not knowing whether it worked or what
+to do now.

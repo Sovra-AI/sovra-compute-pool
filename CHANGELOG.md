@@ -6,6 +6,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+- Every skill now ends with a plain message saying what happened and what to do next,
+  instead of stopping on a command's output. Setting up a pool finishes with the pool's
+  real size and three next steps (add a computer, run a job, check on it), and explains
+  that Sovra's Training page is separate from the pool if asked.
+
+- Add a cleanup guide for retiring one worker or a whole pool, including services,
+  invitations, job results, network settings and the optional Kubernetes setup.
+
 ## [0.1.0] - 2026-11-22
 
 First public release, as an official Sovra plugin.

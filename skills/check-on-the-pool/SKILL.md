@@ -59,3 +59,11 @@ computer), then `journalctl --user -u dist-alloc-agent -n 50 --no-pager`.
 To restart everything on one computer: `systemctl --user restart dist-alloc-server` (main
 computer only) and `systemctl --user restart dist-alloc-agent`. Running jobs on a
 restarted agent are moved elsewhere and do not use up a retry.
+
+## Always finish with a plain message
+
+Your last message must be words to the person, never a tool call. After the last command
+has run, say in two or three plain sentences what you did and whether it worked, then list
+what they can do next, one short line each. Never end the turn on a command's output: a
+list of terminal cards with no words leaves people not knowing whether it worked or what
+to do now.

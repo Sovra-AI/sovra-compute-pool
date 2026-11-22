@@ -72,3 +72,11 @@ For people who already use Kubernetes and want containers, a web dashboard and a
 VPN between sites, the repository also contains a separate K3s-based setup. It needs
 administrator rights on every computer. See [kubernetes-pool.md](kubernetes-pool.md) and
 offer it only if they ask for Kubernetes, containers or a VPN.
+
+## Always finish with a plain message
+
+Your last message must be words to the person, never a tool call. After the last command
+has run, say in two or three plain sentences what you did and whether it worked, then list
+what they can do next, one short line each. Never end the turn on a command's output: a
+list of terminal cards with no words leaves people not knowing whether it worked or what
+to do now.
