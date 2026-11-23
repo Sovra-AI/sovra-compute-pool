@@ -20,6 +20,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use nix::sys::signal::Signal;
 
 use crate::net::{self, ApiFailure, Endpoint, Token, constant_time_eq};
@@ -33,6 +34,7 @@ use crate::store::{self, GcPolicy, Store};
 /// Most log bytes shipped per task per heartbeat.
 pub const LOG_CHUNK_MAX: usize = 256 << 10;
 const FETCH_PARALLELISM: usize = 4;
+const FETCH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const KILL_GRACE: Duration = Duration::from_secs(10);
 
 pub struct AgentOpts {
@@ -173,6 +175,7 @@ struct Agent {
     gpu_stats: Mutex<Vec<GpuStat>>,
     tasks: Mutex<HashMap<String, Local>>,
     peers: Mutex<HashMap<String, Endpoint>>,
+    fetch_slots: tokio::sync::Semaphore,
 }
 
 fn kill_group(pgid: i32, signal: Signal) {
@@ -209,9 +212,16 @@ impl Agent {
     // ------------------------------------------------------------ blobs
 
     async fn download(&self, request: reqwest::RequestBuilder, hash: &str) -> Result<()> {
-        let mut response = net::send(request).await?;
+        // Allow large transfers as long as they make progress. A stalled peer must
+        // eventually yield its slot or fall through to the next available source.
+        let mut response = tokio::time::timeout(FETCH_IDLE_TIMEOUT, net::send(request))
+            .await
+            .context("blob source did not respond")??;
         let mut writer = self.store.writer(false).await?;
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = tokio::time::timeout(FETCH_IDLE_TIMEOUT, response.chunk())
+            .await
+            .context("blob source stopped sending data")??
+        {
             writer.write(&chunk).await?;
         }
         writer.finish(Some(hash)).await?;
@@ -239,9 +249,12 @@ impl Agent {
         if let Some(path) = self.store.find(hash) {
             return Ok(path);
         }
+        // Cache hits and duplicate waiters do not consume a network slot.
+        let _slot = self.fetch_slots.acquire().await?;
         let sources: BlobSources = net::send_json(
             self.server
                 .get(&format!("/v1/blobs/{hash}/sources"))
+                .timeout(FETCH_IDLE_TIMEOUT)
                 .query(&[("exclude", &self.name)]),
         )
         .await
@@ -312,41 +325,31 @@ impl Agent {
     /// Pulls every input onto local disk and links it under `inputs_dir`. Returns `false`
     /// when the task was cancelled first.
     async fn stage_inputs(
-        self: &Arc<Self>,
+        &self,
         a: &Assignment,
         inputs_dir: &FsPath,
         cancel: &Cancel,
     ) -> Result<bool> {
         self.set_state(&a.task_id, TaskState::Fetching, None);
-        let limit = Arc::new(tokio::sync::Semaphore::new(FETCH_PARALLELISM));
-        let mut fetches = tokio::task::JoinSet::new();
-        for input in a.inputs.clone() {
-            if !safe_name(&input.name) {
-                bail!("input name {:?} is not a safe relative path", input.name);
-            }
-            let (agent, limit) = (self.clone(), limit.clone());
-            fetches.spawn(async move {
-                let _slot = limit.acquire_owned().await;
-                let path = agent.ensure_blob(&input.hash).await;
-                path.map(|path| (input, path))
-            });
-        }
-        loop {
-            tokio::select! {
-                () = cancel.wait() => return Ok(false),
-                next = fetches.join_next() => {
-                    let Some(joined) = next else { break };
-                    let (input, path) = joined??;
-                    let link = inputs_dir.join(&input.name);
-                    if let Some(parent) = link.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    tokio::fs::symlink(&path, &link).await?;
+        let stage = stream::iter(&a.inputs).map(Ok).try_for_each_concurrent(
+            FETCH_PARALLELISM,
+            |input| async move {
+                if !safe_name(&input.name) {
+                    bail!("input name {:?} is not a safe relative path", input.name);
                 }
-            }
+                let path = self.ensure_blob(&input.hash).await?;
+                let link = inputs_dir.join(&input.name);
+                if let Some(parent) = link.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::symlink(path, link).await?;
+                Ok(())
+            },
+        );
+        tokio::select! {
+            () = cancel.wait() => Ok(false),
+            result = stage => result.map(|()| true),
         }
-
-        Ok(true)
     }
 
     /// The task's process, not yet started: its own process group, `CUDA_VISIBLE_DEVICES`
@@ -437,7 +440,7 @@ impl Agent {
     }
 
     async fn execute(
-        self: &Arc<Self>,
+        &self,
         a: &Assignment,
         dir: &FsPath,
         cancel: &Cancel,
@@ -520,16 +523,15 @@ impl Agent {
 
     // ------------------------------------------------------------ heartbeat
 
-    fn stats(&self) -> NodeStats {
-        let blobs = self.store.list();
+    fn stats(&self, cache_blobs: u64, cache_bytes: u64) -> NodeStats {
         NodeStats {
             load1: read_trimmed("/proc/loadavg")
                 .and_then(|s| s.split_whitespace().next()?.parse().ok())
                 .unwrap_or(0.0),
             mem_available_mb: meminfo_mb("MemAvailable:"),
             disk_free_bytes: store::free_bytes(&self.dir).unwrap_or(0),
-            cache_bytes: blobs.iter().map(|(_, size)| size).sum(),
-            cache_blobs: blobs.len() as u64,
+            cache_bytes,
+            cache_blobs,
             gpus: crate::lock(&self.gpu_stats).clone(),
         }
     }
@@ -733,18 +735,35 @@ async fn heartbeat_loop(
 ) {
     let mut sent_version = None;
     let mut want_blobs = true;
+    let (mut cache_blobs, mut cache_bytes) = (0, 0);
     let mut connected = true;
     let path = format!("/v1/nodes/{}/heartbeat", registration.name);
     loop {
         let version = agent.store.version();
-        let blobs = (want_blobs || sent_version != Some(version)).then(|| agent.store.list());
+        let blobs = if want_blobs || sent_version != Some(version) {
+            let worker = agent.clone();
+            let snapshot = tokio::task::spawn_blocking(move || worker.store.list()).await;
+            match snapshot {
+                Ok(blobs) => {
+                    cache_blobs = blobs.len() as u64;
+                    cache_bytes = blobs.iter().map(|(_, size)| size).sum();
+                    Some(blobs)
+                }
+                Err(e) => {
+                    tracing::warn!("reading cache inventory: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let includes_blobs = blobs.is_some();
         let request = agent
             .server
             .post(&path)
             .timeout(Duration::from_secs(20))
             .json(&HeartbeatReq {
-                stats: agent.stats(),
+                stats: agent.stats(cache_blobs, cache_bytes),
                 tasks: agent.reports(),
                 blobs,
             });
@@ -844,6 +863,7 @@ pub async fn run(opts: AgentOpts) -> Result<()> {
         gpu_stats: Mutex::new(gpu_stats),
         tasks: Mutex::default(),
         peers: Mutex::default(),
+        fetch_slots: tokio::sync::Semaphore::new(FETCH_PARALLELISM),
     });
     let registration = RegisterReq {
         name: name.clone(),

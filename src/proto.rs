@@ -111,13 +111,19 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
-    pub fn inputs_for_rank(&self, rank: u32) -> Vec<Blob> {
-        let dealt = self
-            .shards
+    pub fn shards_for_rank(&self, rank: u32) -> impl Iterator<Item = &Blob> {
+        self.shards
             .iter()
             .skip(rank as usize)
-            .step_by(self.replicas.max(1) as usize);
-        self.inputs.iter().chain(dealt).cloned().collect()
+            .step_by(self.replicas.max(1) as usize)
+    }
+
+    pub fn inputs_for_rank(&self, rank: u32) -> Vec<Blob> {
+        self.inputs
+            .iter()
+            .chain(self.shards_for_rank(rank))
+            .cloned()
+            .collect()
     }
 }
 

@@ -22,8 +22,8 @@ impl Drop for Daemon {
     }
 }
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("da-e2e-{}", std::process::id()));
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("da-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -85,12 +85,10 @@ fn wait_for(what: &str, deadline: Duration, mut ready: impl FnMut() -> bool) {
     }
 }
 
-#[test]
-fn a_job_runs_on_a_joined_device_and_its_output_comes_back() {
-    let dir = scratch();
+fn start_pool(dir: &Path) -> (Daemon, String, String) {
     let server = format!("127.0.0.1:{}", free_port());
     let server_dir = dir.join("server");
-    let _control = daemon(
+    let control = daemon(
         &[
             "server",
             "--listen",
@@ -104,34 +102,47 @@ fn a_job_runs_on_a_joined_device_and_its_output_comes_back() {
     wait_for("the control plane", Duration::from_secs(20), || {
         token_file.exists()
     });
-    let token = std::fs::read_to_string(&token_file).unwrap();
+    let token = std::fs::read_to_string(token_file).unwrap();
+    (control, server, token)
+}
 
-    let agent_dir = dir.join("agent");
-    let _agent = daemon(
+fn start_agent(dir: &Path, server: &str, token: &str, name: &str) -> Daemon {
+    daemon(
         &[
             "agent",
             "--server",
-            &server,
+            server,
             "--token",
-            &token,
+            token,
             "--name",
-            "box1",
+            name,
             "--no-gpus",
+            "--cpus",
+            "1",
             "--blob-port",
             "0",
             "--data-dir",
-            agent_dir.to_str().unwrap(),
+            dir.join(name).to_str().unwrap(),
         ],
-        &dir.join("agent.log"),
-    );
-    let cli = |args: &[&str]| -> Output {
-        Command::new(BIN)
-            .args(args)
-            .env("DA_SERVER", &server)
-            .env("DA_TOKEN", &token)
-            .output()
-            .unwrap()
-    };
+        &dir.join(format!("{name}.log")),
+    )
+}
+
+fn pool_cli(server: &str, token: &str, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(args)
+        .env("DA_SERVER", server)
+        .env("DA_TOKEN", token)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_job_runs_on_a_joined_device_and_its_output_comes_back() {
+    let dir = scratch("run");
+    let (_control, server, token) = start_pool(&dir);
+    let _agent = start_agent(&dir, &server, &token, "box1");
+    let cli = |args: &[&str]| pool_cli(&server, &token, args);
     wait_for("the device to join", Duration::from_secs(20), || {
         String::from_utf8_lossy(&cli(&["nodes"]).stdout).contains("box1  ready")
     });
@@ -185,4 +196,89 @@ fn a_job_runs_on_a_joined_device_and_its_output_comes_back() {
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("does not match this token"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_workers_stage_shared_inputs_and_only_their_own_dataset_shards() {
+    let dir = scratch("shards");
+    let (_control, server, token) = start_pool(&dir);
+    let _first = start_agent(&dir, &server, &token, "box1");
+    let _second = start_agent(&dir, &server, &token, "box2");
+    let cli = |args: &[&str]| pool_cli(&server, &token, args);
+    wait_for("both workers", Duration::from_secs(20), || {
+        String::from_utf8_lossy(&cli(&["nodes"]).stdout).contains("2 of 2 nodes ready")
+    });
+
+    let shared = dir.join("common");
+    std::fs::write(&shared, "shared").unwrap();
+    let files: Vec<_> = (0..12)
+        .map(|i| {
+            let path = dir.join(format!("shard-{i}"));
+            std::fs::write(&path, format!("shard {i}")).unwrap();
+            path
+        })
+        .collect();
+    let mut create = vec!["dataset", "create", "corpus"];
+    create.extend(files.iter().map(|p| p.to_str().unwrap()));
+    assert!(cli(&create).status.success());
+    let run = cli(&[
+        "run",
+        "--replicas",
+        "2",
+        "--memory-mb",
+        "1",
+        "--dataset",
+        "corpus",
+        "--partition",
+        "-i",
+        shared.to_str().unwrap(),
+        "--",
+        "sh",
+        "-ec",
+        r#"
+            test "$(cat "$DA_INPUTS_DIR/common")" = shared
+            set -- "$DA_INPUTS_DIR"/corpus/*
+            test "$#" = 6
+            for path do
+                i=${path##*-}
+                test "$((i % 2))" = "$DA_RANK"
+                test "$(cat "$path")" = "shard $i"
+            done
+            if [ "$DA_RANK" = 0 ]; then echo result > "$DA_OUTPUT_DIR/result.txt"; fi
+            echo "$DA_NODE $DA_RANK $DA_WORLD_SIZE"
+        "#,
+    ]);
+    assert!(run.status.success(), "{run:?}");
+    let stdout = String::from_utf8(run.stdout).unwrap();
+    assert!(
+        stdout.contains("[r0] box1 0 2") && stdout.contains("[r1] box2 1 2"),
+        "{stdout}"
+    );
+    let detail = cli(&["job", "j1"]);
+    assert!(detail.status.success());
+    let rows: Vec<_> = String::from_utf8(detail.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|r| r == "TASK NODE GPUS STATE EXIT OUTPUTS NOTE")
+    );
+    assert!(rows.iter().any(|r| r == "j1.1.0 box1 - succeeded 0 1"));
+    assert!(rows.iter().any(|r| r == "j1.1.1 box2 - succeeded 0 0"));
+    wait_for(
+        "both workers' cache and capacity reports",
+        Duration::from_secs(10),
+        || {
+            let nodes: Vec<serde_json::Value> =
+                serde_json::from_slice(&cli(&["nodes", "--json"]).stdout).unwrap();
+            nodes.len() == 2
+                && nodes.iter().all(|n| {
+                    let count = if n["name"] == "box1" { 8 } else { 7 };
+                    n["alloc_cpus"] == 0 && n["stats"]["cache_blobs"] == count
+                })
+        },
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

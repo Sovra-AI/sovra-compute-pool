@@ -412,6 +412,7 @@ fn placement(job: &JobView) -> String {
         .filter(|t| t.attempt == job.attempt)
         .map(|t| t.node.as_str())
         .collect();
+    nodes.sort_unstable();
     nodes.dedup();
     if nodes.is_empty() {
         "-".into()
@@ -494,12 +495,16 @@ pub async fn job(ep: &Endpoint, id: &str, json: bool) -> Result<()> {
                 },
                 format!("{:?}", t.state).to_lowercase(),
                 t.exit_code.map(|c| c.to_string()).unwrap_or_default(),
+                t.outputs.len().to_string(),
                 t.message.clone().unwrap_or_default(),
             ]
         })
         .collect();
     println!();
-    table(&["TASK", "NODE", "GPUS", "STATE", "EXIT", "NOTE"], &rows);
+    table(
+        &["TASK", "NODE", "GPUS", "STATE", "EXIT", "OUTPUTS", "NOTE"],
+        &rows,
+    );
     let outputs: Vec<Vec<String>> = job
         .tasks
         .iter()

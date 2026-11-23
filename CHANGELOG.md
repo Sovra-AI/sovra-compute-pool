@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+- The run-job skill preserves supplied input files and checks the recorded outputs
+  for each rank before reporting results. The job detail table shows how many files
+  each task produced.
+
+- Workers reuse cache counts between inventory changes and share four concurrent input
+  downloads across all jobs on a machine. A source that stops sending data for 30 seconds
+  gives way to the next available copy.
+- Idle heartbeats skip state-file writes and job-history scans. Job listings and gang
+  placement do less work for pools with long histories or large shared datasets.
+- Cancelling during delivery holds the reservation until the worker accounts for the
+  task. Among equally local, equally packed nodes, GPU jobs prefer the smaller adequate
+  cards.
+
 - Every skill now ends with a plain message saying what happened and what to do next,
   instead of stopping on a command's output. Setting up a pool finishes with the pool's
   real size and three next steps (add a computer, run a job, check on it), and explains

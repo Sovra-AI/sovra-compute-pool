@@ -197,7 +197,12 @@ impl Store {
         let victims = plan_eviction(&entries, need, &pinned, policy.min_age, SystemTime::now());
         let mut freed = (0, 0);
         for victim in victims {
-            if std::fs::remove_file(self.blobs.join(&victim.hash)).is_ok() {
+            // A task may have pinned this candidate since the scan. Keep pin() and
+            // unlink mutually exclusive so a newly staged symlink stays valid.
+            let pins = crate::lock(&self.pins);
+            if !pins.contains_key(&victim.hash)
+                && std::fs::remove_file(self.blobs.join(&victim.hash)).is_ok()
+            {
                 freed.0 += 1;
                 freed.1 += victim.size;
             }

@@ -25,9 +25,15 @@ Ask only what you cannot work out from their request or files:
 - How much does it need per copy: graphics cards, memory, cores? How many copies?
 - Which files does it need (code, data), and what should come back (a model, results)?
 
-Then run `~/.local/bin/dist-alloc nodes` to see what the pool has, and check the request
-fits. Explain any mismatch in plain words ("the pool has one graphics card, so two copies
-that each need one would wait forever").
+Treat supplied paths as existing inputs. Read or stage those files as supplied. If an
+input is missing, identify the path and ask for it. Create or edit input files only when
+the person requests that change.
+
+Use `dist-alloc nodes --json` to check the fit. Each copy needs all of its cores, memory
+and qualifying graphics cards on one ready computer matching the requested labels. For
+example, two computers with one card each can run two one-card copies. A single two-card
+copy needs a computer with both cards. Compare free resources with total capacity so the
+person knows whether waiting for another job to finish would help.
 
 **Important:** jobs run as ordinary programs on the pool's computers, not in containers.
 Whatever the command needs (Python, PyTorch, a CUDA driver…) must already be installed on
@@ -70,15 +76,20 @@ For training across several copies, the pool provides `DA_RANK`, `DA_WORLD_SIZE`
 `DA_MASTER_ADDR` and `DA_PEER_HOSTS`; see the PyTorch example in
 [job-reference.md](job-reference.md).
 
-**Large datasets:** upload them once with `dist-alloc dataset create NAME FILES…` and use
-`--dataset NAME`. Computers then fetch them from each other and keep a local copy, so later
-jobs start faster.
+For repeated runs, reuse a named dataset with `--dataset NAME`. Create it once with
+`dist-alloc dataset create NAME FILES…`. Add `--partition` when each copy can work on its
+own subset of files. A program that expects every copy to see the full dataset needs the
+default shared layout.
 
 ## 3. Bring back the results
 
-When `dist-alloc job ID` says `succeeded`, its OUTPUT table lists each result file with its
-hash. Fetch each one where the person wants it:
-`dist-alloc blob get HASH -o ~/results/model.pt`. Then say where the files are.
+After the job finishes, run `dist-alloc job ID --json`. For each task whose `attempt`
+matches the job's final `attempt`, pair its `rank` and `node` with the filenames in
+that task's own `outputs` array. An empty array means that rank produced no files,
+even when its exit code is zero. Report each requested file only for the ranks that
+list it, and mention any missing results. When asked to download files, use their listed hashes with
+`dist-alloc blob get HASH -o PATH`. Give same-named outputs from different ranks
+distinct destination paths, and report the paths after the downloads succeed.
 
 If it failed, read `dist-alloc logs ID` and the NOTE column of `dist-alloc job ID`, explain
 the cause in plain words, and offer a fix. To stop a job: `dist-alloc cancel ID`.

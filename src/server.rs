@@ -55,6 +55,12 @@ struct Node {
     stats: NodeStats,
     #[serde(skip)]
     blobs: Option<HashMap<Hash, u64>>,
+    /// IDs holding capacity, rebuilt from saved tasks on startup.
+    #[serde(skip)]
+    reservations: BTreeSet<String>,
+    /// The housekeeper has already processed the current timeout.
+    #[serde(skip)]
+    offline: bool,
     /// After a control-plane restart every known node gets a fresh grace period.
     #[serde(skip, default = "Instant::now")]
     last_seen: Instant,
@@ -83,6 +89,10 @@ struct Task {
     node: String,
     gpus: Vec<u32>,
     state: TaskState,
+    /// A heartbeat response may already have reached the agent. A saved snapshot can
+    /// predate delivery, so after any restart assume the worker may have the task.
+    #[serde(skip, default = "possibly_delivered")]
+    delivered: bool,
     /// The agent has reported this task at least once.
     acked: bool,
     /// Its CPUs/memory/GPUs are free again. Lags `state` when the control plane has
@@ -92,6 +102,34 @@ struct Task {
     message: Option<String>,
     log_offset: u64,
     outputs: Vec<Blob>,
+}
+
+fn possibly_delivered() -> bool {
+    true
+}
+
+impl Task {
+    fn stop(&mut self, why: &str, nodes: &mut BTreeMap<String, Node>) {
+        if !self.state.is_terminal() {
+            self.state = TaskState::Killed;
+            self.message = Some(why.to_owned());
+            if !self.delivered && !self.acked {
+                self.released = true;
+                if let Some(node) = nodes.get_mut(&self.node) {
+                    node.reservations.remove(&self.id);
+                }
+            }
+        }
+    }
+
+    /// Called when the node or process is gone. The caller also drops its reservation.
+    fn lose(&mut self, why: &str) {
+        if !self.state.is_terminal() {
+            self.state = TaskState::Lost;
+            self.message = Some(why.to_owned());
+        }
+        self.released = true;
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,6 +163,20 @@ fn now() -> u64 {
 }
 
 impl State {
+    fn restore_reservations(&mut self) {
+        for task in self.tasks.values().filter(|t| !t.released) {
+            if let Some(node) = self.nodes.get_mut(&task.node) {
+                node.reservations.insert(task.id.clone());
+            }
+        }
+    }
+
+    // Task keys are "job.attempt.rank". This bounds history lookups to one job,
+    // including when another job ID has the same prefix (j1 versus j10).
+    fn task_keys(prefix: &str) -> std::ops::RangeInclusive<String> {
+        format!("{prefix}.")..=format!("{prefix}.{}", char::MAX)
+    }
+
     /// Capacity of every ready node minus what unreleased tasks hold.
     fn free_nodes(&self) -> Vec<NodeFree<'_>> {
         self.nodes
@@ -144,10 +196,8 @@ impl State {
                     labels: &node.labels,
                     blobs: node.blobs.as_ref(),
                 };
-                for task in self.tasks.values() {
-                    if task.node != node.name || task.released {
-                        continue;
-                    }
+                for id in &node.reservations {
+                    let task = &self.tasks[id];
                     let held = &self.jobs[&task.job_id].spec.resources;
                     free.cpus = free.cpus.saturating_sub(held.cpus);
                     free.memory_mb = free.memory_mb.saturating_sub(held.memory_mb);
@@ -160,12 +210,15 @@ impl State {
 
     /// Places as many queued jobs as fit, highest priority first, oldest first within a
     /// priority. A job that does not fit does not block smaller ones behind it.
-    fn schedule(&mut self) {
+    fn schedule(&mut self) -> bool {
         let mut queue: Vec<&Job> = self
             .jobs
             .values()
             .filter(|job| job.state == JobState::Queued)
             .collect();
+        if queue.is_empty() {
+            return false;
+        }
         queue.sort_by_key(|job| (std::cmp::Reverse(job.spec.priority), job.seq));
 
         let mut free = self.free_nodes();
@@ -175,16 +228,28 @@ impl State {
             .collect();
         drop(free);
 
+        let mut changed = false;
         for (job_id, decision) in decisions {
             let job = self.jobs.get_mut(&job_id).expect("job exists");
             match decision {
-                Err(why) => job.message = Some(why),
+                Err(why) => {
+                    if job.message.as_ref() != Some(&why) {
+                        job.message = Some(why);
+                        changed = true;
+                    }
+                }
                 Ok(placements) => {
+                    changed = true;
                     job.state = JobState::Running;
                     job.started_at = Some(now());
                     job.message = None;
                     for (rank, placement) in (0u32..).zip(placements) {
                         let id = format!("{}.{}.{rank}", job.id, job.attempt);
+                        self.nodes
+                            .get_mut(&placement.node)
+                            .expect("placed on ready node")
+                            .reservations
+                            .insert(id.clone());
                         self.tasks.insert(
                             id.clone(),
                             Task {
@@ -195,6 +260,7 @@ impl State {
                                 node: placement.node,
                                 gpus: placement.gpus,
                                 state: TaskState::Assigned,
+                                delivered: false,
                                 acked: false,
                                 released: false,
                                 exit_code: None,
@@ -207,17 +273,7 @@ impl State {
                 }
             }
         }
-    }
-
-    /// Marks a live task dead on the control plane's authority. Its resources stay held
-    /// until the node confirms, unless the node never knew about it or is itself gone.
-    fn terminate(task: &mut Task, state: TaskState, why: &str, node_gone: bool) {
-        if task.state.is_terminal() {
-            return;
-        }
-        task.state = state;
-        task.message = Some(why.to_owned());
-        task.released = node_gone || !task.acked;
+        changed
     }
 
     /// Advances a running job once its tasks have settled: success when every replica
@@ -229,8 +285,12 @@ impl State {
         if job.state != JobState::Running {
             return;
         }
-        let current = |task: &&mut Task| task.job_id == job.id && task.attempt == job.attempt;
-        let mut tasks: Vec<&mut Task> = self.tasks.values_mut().filter(current).collect();
+        let attempt = format!("{}.{}", job.id, job.attempt);
+        let mut tasks: Vec<&mut Task> = self
+            .tasks
+            .range_mut(Self::task_keys(&attempt))
+            .map(|(_, task)| task)
+            .collect();
 
         if tasks.iter().all(|t| t.state == TaskState::Succeeded) {
             job.state = JobState::Succeeded;
@@ -259,11 +319,9 @@ impl State {
             (None, None) => format!("rank {} on {} failed", culprit.rank, culprit.node),
         };
         for task in &mut tasks {
-            Self::terminate(
-                task,
-                TaskState::Killed,
+            task.stop(
                 "stopped: another replica of the job failed",
-                false,
+                &mut self.nodes,
             );
         }
 
@@ -290,8 +348,8 @@ impl State {
             job.state = JobState::Cancelled;
             job.finished_at = Some(now());
             job.message = None;
-            for task in self.tasks.values_mut().filter(|t| t.job_id == job_id) {
-                Self::terminate(task, TaskState::Killed, "cancelled", false);
+            for (_, task) in self.tasks.range_mut(Self::task_keys(job_id)) {
+                task.stop("cancelled", &mut self.nodes);
             }
         }
         true
@@ -299,38 +357,55 @@ impl State {
 
     /// Declares the tasks of unresponsive nodes lost. Returns whether anything changed.
     fn sweep_lost_nodes(&mut self) -> bool {
-        let gone: HashSet<&str> = self
-            .nodes
-            .values()
-            .filter(|node| !node.ready())
-            .map(|node| node.name.as_str())
-            .collect();
-        let mut affected = BTreeSet::new();
-        for task in self.tasks.values_mut() {
-            if gone.contains(task.node.as_str()) && !(task.state.is_terminal() && task.released) {
-                let job = task.job_id.clone();
-                Self::terminate(task, TaskState::Lost, "node stopped responding", true);
-                task.released = true;
-                affected.insert(job);
+        let mut lost = Vec::new();
+        let mut timed_out = false;
+        for node in self.nodes.values_mut() {
+            if !node.offline && !node.ready() {
+                node.offline = true;
+                timed_out = true;
+                lost.extend(std::mem::take(&mut node.reservations));
             }
+        }
+        if !timed_out {
+            return false;
+        }
+        let changed = self.lose_tasks(lost, "node stopped responding");
+        self.schedule() || changed
+    }
+
+    fn lose_tasks(&mut self, ids: impl IntoIterator<Item = String>, why: &str) -> bool {
+        let mut affected = BTreeSet::new();
+        for id in ids {
+            let task = self.tasks.get_mut(&id).expect("reserved task exists");
+            task.lose(why);
+            affected.insert(task.job_id.clone());
         }
         for job in &affected {
             self.reconcile(job);
         }
-        if !affected.is_empty() {
-            self.schedule();
-        }
         !affected.is_empty()
     }
 
-    fn assignment(&self, task: &Task) -> Assignment {
-        let job = &self.jobs[&task.job_id];
-        let mut gang: Vec<&Task> = self
+    fn peer_hosts(&self, task: &Task) -> Vec<String> {
+        let attempt = format!("{}.{}", task.job_id, task.attempt);
+        let mut gang: Vec<_> = self
             .tasks
-            .values()
-            .filter(|t| t.job_id == task.job_id && t.attempt == task.attempt)
+            .range(Self::task_keys(&attempt))
+            .map(|(_, task)| task)
             .collect();
-        gang.sort_by_key(|t| t.rank);
+        gang.sort_unstable_by_key(|t| t.rank);
+        gang.into_iter()
+            .map(|t| {
+                self.nodes
+                    .get(&t.node)
+                    .map(|n| n.host.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn assignment(&self, task: &Task, peer_hosts: &[String]) -> Assignment {
+        let job = &self.jobs[&task.job_id];
         Assignment {
             task_id: task.id.clone(),
             job_id: job.id.clone(),
@@ -341,21 +416,20 @@ impl State {
             env: job.spec.env.clone(),
             gpus: task.gpus.clone(),
             inputs: job.spec.inputs_for_rank(task.rank),
-            peer_hosts: gang
-                .iter()
-                .map(|t| {
-                    self.nodes
-                        .get(&t.node)
-                        .map(|n| n.host.clone())
-                        .unwrap_or_default()
-                })
-                .collect(),
+            peer_hosts: peer_hosts.to_vec(),
         }
     }
 
     /// Applies one node heartbeat. `None` means the node is unknown and must re-register.
-    fn heartbeat(&mut self, name: &str, req: HeartbeatReq, logs: &FsPath) -> Option<HeartbeatResp> {
+    fn heartbeat(
+        &mut self,
+        name: &str,
+        req: HeartbeatReq,
+        logs: &FsPath,
+    ) -> Option<(HeartbeatResp, bool)> {
         let node = self.nodes.get_mut(name)?;
+        let reconsider = !node.ready() || node.blobs.is_none();
+        node.offline = false;
         node.last_seen = Instant::now();
         node.stats = req.stats;
         if let Some(blobs) = req.blobs {
@@ -366,6 +440,8 @@ impl State {
             ..Default::default()
         };
 
+        let mut changed = false;
+        let mut stale_process = false;
         let mut reported = HashSet::new();
         let mut affected = BTreeSet::new();
         for report in req.tasks {
@@ -379,10 +455,12 @@ impl State {
                 if report.state.is_terminal() {
                     resp.forget.push(report.task_id);
                 } else {
+                    stale_process = true;
                     resp.kill.push(report.task_id);
                 }
                 continue;
             };
+            changed |= !task.acked;
             task.acked = true;
 
             if report.log_len > 0 && report.log_offset == task.log_offset {
@@ -393,12 +471,16 @@ impl State {
                     .and_then(|mut file| file.write_all(report.log.as_bytes()));
                 if appended.is_ok() {
                     task.log_offset += report.log_len;
+                    changed = true;
                 }
             }
             resp.log_offsets.insert(task.id.clone(), task.log_offset);
             let logs_complete = task.log_offset >= report.log_total;
 
             if !task.state.is_terminal() {
+                changed |= task.state != report.state
+                    || task.exit_code != report.exit_code
+                    || task.message != report.message;
                 task.state = report.state;
                 task.exit_code = report.exit_code;
                 task.message = report.message;
@@ -408,11 +490,14 @@ impl State {
                 }
             } else if !report.state.is_terminal() {
                 // We already gave up on it (cancel, gang failure, node flap): stop it.
+                stale_process |= task.released;
                 resp.kill.push(task.id.clone());
             }
             if report.state.is_terminal() {
                 if !task.released {
                     task.released = true;
+                    node.reservations.remove(&task.id);
+                    changed = true;
                     affected.insert(task.job_id.clone());
                 }
                 if logs_complete {
@@ -421,27 +506,54 @@ impl State {
             }
         }
 
-        // Tasks the node acknowledged earlier but no longer knows: the agent restarted.
-        for task in self.tasks.values_mut() {
-            if task.node == name && task.acked && !task.released && !reported.contains(&task.id) {
-                Self::terminate(task, TaskState::Lost, "agent restarted", true);
-                task.released = true;
+        // A missing acknowledged task died with the old agent. A cancelled delivery
+        // also settles here if its response never reached the agent.
+        node.reservations.retain(|id| {
+            let task = self.tasks.get_mut(id).expect("reserved task exists");
+            if (task.acked || task.state.is_terminal()) && !reported.contains(id) {
+                task.lose("agent restarted");
                 affected.insert(task.job_id.clone());
+                changed = true;
+                return false;
             }
-        }
+            true
+        });
         for job in &affected {
             self.reconcile(job);
         }
-        self.schedule();
+        if reconsider || !affected.is_empty() {
+            changed |= self.schedule();
+        }
+        // A returning node may still be running old work whose GPUs we reclaimed
+        // while it was offline. Wait for its next report before starting new work.
+        if stale_process {
+            return Some((resp, changed));
+        }
+        resp.assign = self.deliver_assignments(name);
+        Some((resp, changed))
+    }
 
-        // Deliver until acknowledged; the agent ignores duplicates.
-        resp.assign = self
-            .tasks
-            .values()
-            .filter(|t| t.node == name && t.state == TaskState::Assigned && !t.acked)
-            .map(|t| self.assignment(t))
-            .collect();
-        Some(resp)
+    /// Deliver until acknowledged. Resolve the rank-ordered hosts once per gang.
+    fn deliver_assignments(&mut self, name: &str) -> Vec<Assignment> {
+        let mut assignments = Vec::new();
+        let mut gangs = HashMap::new();
+        for id in &self.nodes[name].reservations {
+            let task = &self.tasks[id];
+            if task.state == TaskState::Assigned && !task.acked {
+                let hosts = gangs
+                    .entry((&task.job_id, task.attempt))
+                    .or_insert_with(|| self.peer_hosts(task));
+                assignments.push(self.assignment(task, hosts));
+            }
+        }
+        for assignment in &assignments {
+            let task = self
+                .tasks
+                .get_mut(&assignment.task_id)
+                .expect("assigned task exists");
+            task.delivered = true;
+        }
+        assignments
     }
 
     /// `host:port` of ready nodes caching `hash`, starting at a random one to spread load.
@@ -474,14 +586,13 @@ impl State {
             alloc_gpus: Vec::new(),
             tasks: Vec::new(),
         };
-        for task in self.tasks.values() {
-            if task.node == node.name && !task.released {
-                let held = &self.jobs[&task.job_id].spec.resources;
-                view.alloc_cpus += held.cpus;
-                view.alloc_memory_mb += held.memory_mb;
-                view.alloc_gpus.extend(&task.gpus);
-                view.tasks.push(task.id.clone());
-            }
+        for id in &node.reservations {
+            let task = &self.tasks[id];
+            let held = &self.jobs[&task.job_id].spec.resources;
+            view.alloc_cpus += held.cpus;
+            view.alloc_memory_mb += held.memory_mb;
+            view.alloc_gpus.extend(&task.gpus);
+            view.tasks.push(id.clone());
         }
         view.alloc_gpus.sort_unstable();
         view
@@ -490,9 +601,8 @@ impl State {
     fn job_view(&self, job: &Job) -> JobView {
         let mut tasks: Vec<TaskView> = self
             .tasks
-            .values()
-            .filter(|t| t.job_id == job.id)
-            .map(|t| TaskView {
+            .range(Self::task_keys(&job.id))
+            .map(|(_, t)| TaskView {
                 id: t.id.clone(),
                 rank: t.rank,
                 attempt: t.attempt,
@@ -524,6 +634,7 @@ impl State {
 struct Server {
     state: Mutex<State>,
     dirty: AtomicBool,
+    save_lock: Mutex<()>,
     store: Store,
     identity: Identity,
     token: Token,
@@ -546,9 +657,18 @@ impl Server {
     }
 
     fn save(&self) -> std::io::Result<()> {
+        let _exclusive = crate::lock(&self.save_lock);
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
+        let result = self.write_snapshot();
+        if result.is_err() {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn write_snapshot(&self) -> std::io::Result<()> {
         let json = serde_json::to_vec(&*crate::lock(&self.state))?;
         let tmp = self.state_path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
@@ -580,13 +700,14 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
     };
 
     let state_path = dir.join("state.json");
-    let state: State = match std::fs::read(&state_path) {
+    let mut state: State = match std::fs::read(&state_path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("{} is corrupt", state_path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
         // Starting empty would overwrite the saved jobs and devices on the next save.
         Err(e) => return Err(e).with_context(|| format!("reading {}", state_path.display())),
     };
+    state.restore_reservations();
     tracing::info!(
         listen = %opts.listen,
         nodes = state.nodes.len(),
@@ -601,6 +722,7 @@ pub async fn run(opts: ServerOpts) -> Result<()> {
     let app: App = Arc::new(Server {
         state: Mutex::new(state),
         dirty: AtomicBool::new(false),
+        save_lock: Mutex::default(),
         store: Store::open(dir)?,
         identity,
         token,
@@ -786,6 +908,11 @@ async fn register(
         "node joined"
     );
     app.update(|state| {
+        let reservations = state
+            .nodes
+            .remove(&req.name)
+            .map(|n| n.reservations)
+            .unwrap_or_default();
         state.nodes.insert(
             req.name.clone(),
             Node {
@@ -796,6 +923,8 @@ async fn register(
                 labels: req.labels,
                 stats: NodeStats::default(),
                 blobs: None,
+                reservations,
+                offline: false,
                 last_seen: Instant::now(),
             },
         );
@@ -813,9 +942,13 @@ async fn heartbeat(
     Path(name): Path<String>,
     Json(req): Json<HeartbeatReq>,
 ) -> Result<Json<HeartbeatResp>, Fail> {
-    app.update(|state| state.heartbeat(&name, req, &app.logs))
-        .map(Json)
-        .ok_or_else(|| not_found(format!("node {name} is not registered")))
+    let (resp, changed) = crate::lock(&app.state)
+        .heartbeat(&name, req, &app.logs)
+        .ok_or_else(|| not_found(format!("node {name} is not registered")))?;
+    if changed {
+        app.dirty.store(true, Ordering::SeqCst);
+    }
+    Ok(Json(resp))
 }
 
 async fn list_nodes(AxState(app): AxState<App>) -> Json<Vec<NodeView>> {
@@ -827,21 +960,11 @@ async fn remove_node(
     Path(name): Path<String>,
 ) -> Result<StatusCode, Fail> {
     app.update(|state| {
-        state
+        let node = state
             .nodes
             .remove(&name)
             .ok_or_else(|| not_found(format!("no node {name}")))?;
-        let mut affected = BTreeSet::new();
-        for task in state.tasks.values_mut().filter(|t| t.node == name) {
-            if !task.released {
-                State::terminate(task, TaskState::Lost, "node removed", true);
-                task.released = true;
-                affected.insert(task.job_id.clone());
-            }
-        }
-        for job in &affected {
-            state.reconcile(job);
-        }
+        state.lose_tasks(node.reservations, "node removed");
         state.schedule();
         Ok(StatusCode::NO_CONTENT)
     })
@@ -1103,6 +1226,8 @@ mod tests {
                     labels: BTreeMap::new(),
                     stats: NodeStats::default(),
                     blobs: Some(HashMap::new()),
+                    reservations: BTreeSet::new(),
+                    offline: false,
                     last_seen: Instant::now(),
                 },
             );
@@ -1165,6 +1290,7 @@ mod tests {
         state
             .heartbeat(node, req, logs)
             .expect("node is registered")
+            .0
     }
 
     #[test]
@@ -1358,15 +1484,112 @@ mod tests {
     }
 
     #[test]
-    fn saved_state_round_trips_and_restarted_nodes_get_a_grace_period() {
-        let (mut state, _logs) = cluster(&["a", "b"]);
+    fn cancelled_delivery_keeps_the_gpu_until_the_worker_accounts_for_it() {
+        for received in [true, false] {
+            let (mut state, logs) = cluster(&["a"]);
+            let job = submit(&mut state, spec(1, 1, 0));
+            let task = beat(&mut state, &logs, "a", &[]).assign[0].task_id.clone();
+            assert!(state.cancel(&job));
+            let next = submit(&mut state, spec(1, 1, 0));
+            assert_eq!(state.jobs[&next].state, JobState::Queued);
+            let resp = if received {
+                let running = beat(&mut state, &logs, "a", &[(&task, TaskState::Running, None)]);
+                assert_eq!(running.kill, std::slice::from_ref(&task));
+                assert!(running.assign.is_empty());
+                beat(&mut state, &logs, "a", &[(&task, TaskState::Killed, None)])
+            } else {
+                beat(&mut state, &logs, "a", &[])
+            };
+            assert_eq!(resp.assign.len(), 1);
+            assert_eq!(resp.assign[0].job_id, next);
+            assert_eq!(state.node_view(&state.nodes["a"]).alloc_gpus, [0]);
+        }
+    }
+
+    #[test]
+    fn a_returning_node_stops_lost_work_before_it_receives_its_retry() {
+        let (mut state, logs) = cluster(&["a"]);
+        let job = submit(&mut state, spec(1, 1, 0));
+        let task = beat(&mut state, &logs, "a", &[]).assign[0].task_id.clone();
+        state.nodes.get_mut("a").unwrap().last_seen =
+            Instant::now().checked_sub(NODE_TIMEOUT).unwrap();
+        assert!(state.sweep_lost_nodes());
+        let resp = beat(&mut state, &logs, "a", &[(&task, TaskState::Running, None)]);
+        assert_eq!(resp.kill, std::slice::from_ref(&task));
+        assert!(resp.assign.is_empty());
+        let retry = beat(&mut state, &logs, "a", &[(&task, TaskState::Killed, None)]);
+        assert_eq!(retry.assign.len(), 1);
+        assert_eq!(retry.assign[0].job_id, job);
+        assert_ne!(retry.assign[0].task_id, task);
+    }
+
+    #[test]
+    fn idle_stats_and_repeated_reports_do_not_dirty_saved_state() {
+        let (mut state, logs) = cluster(&["a"]);
+        let beat = |state: &mut State, tasks| {
+            let req = HeartbeatReq {
+                stats: NodeStats {
+                    mem_available_mb: 567,
+                    ..Default::default()
+                },
+                blobs: None,
+                tasks,
+            };
+            state.heartbeat("a", req, &logs).unwrap()
+        };
+        assert!(!beat(&mut state, vec![]).1);
+        assert_eq!(state.nodes["a"].stats.mem_available_mb, 567);
+        let job = submit(&mut state, spec(1, 0, 0));
+        let task = beat(&mut state, vec![]).0.assign[0].task_id.clone();
+        let mut running = TaskReport {
+            task_id: task.clone(),
+            state: TaskState::Running,
+            exit_code: None,
+            message: None,
+            log_offset: 0,
+            log_len: 0,
+            log_total: 0,
+            log: String::new(),
+            outputs: vec![],
+        };
+        assert!(beat(&mut state, vec![running.clone()]).1);
+        assert!(!beat(&mut state, vec![running.clone()]).1);
+        running.log = "ok".into();
+        running.log_len = 2;
+        running.log_total = 2;
+        assert!(beat(&mut state, vec![running.clone()]).1);
+        assert!(!beat(&mut state, vec![running.clone()]).1);
+        assert_eq!(
+            std::fs::read_to_string(logs.join(format!("{task}.log"))).unwrap(),
+            "ok"
+        );
+        running.state = TaskState::Succeeded;
+        running.exit_code = Some(0);
+        assert!(beat(&mut state, vec![running.clone()]).1);
+        assert!(!beat(&mut state, vec![running]).1);
+        assert_eq!(state.jobs[&job].state, JobState::Succeeded);
+    }
+
+    #[test]
+    fn saved_state_restores_reservations_and_treats_unacked_deliveries_conservatively() {
+        let (mut state, logs) = cluster(&["a", "b"]);
         let job = submit(&mut state, spec(2, 1, 0));
         let json = serde_json::to_vec(&state).unwrap();
-        let restored: State = serde_json::from_slice(&json).unwrap();
-        assert_eq!(restored.jobs[&job].state, JobState::Running);
-        assert_eq!(restored.tasks.len(), 2);
+        let mut restored: State = serde_json::from_slice(&json).unwrap();
+        restored.restore_reservations();
+        assert_eq!(restored.job_view(&restored.jobs[&job]).tasks.len(), 2);
         assert_eq!(restored.next_job, state.next_job);
         assert!(restored.nodes.values().all(Node::ready));
+        assert!(restored.free_nodes().iter().all(|n| n.gpus.is_empty()));
+        // A snapshot written before delivery looks exactly like an older state file.
+        assert!(restored.cancel(&job));
+        let waiting = submit(&mut restored, spec(2, 1, 0));
+        assert_eq!(restored.jobs[&waiting].state, JobState::Queued);
+        assert!(beat(&mut restored, &logs, "a", &[]).assign.is_empty());
+        assert_eq!(
+            beat(&mut restored, &logs, "b", &[]).assign[0].job_id,
+            waiting
+        );
     }
 
     #[test]
