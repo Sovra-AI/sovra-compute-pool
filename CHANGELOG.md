@@ -13,6 +13,7 @@ All notable changes to this project are recorded here. The format follows
 
 - Add a cleanup guide for retiring one worker or a whole pool, including services,
   invitations, job results, network settings and the optional Kubernetes setup.
+- Agent uninstall also removes saved join credentials left by an interrupted installation.
 
 ## [0.1.0] - 2026-11-22
 

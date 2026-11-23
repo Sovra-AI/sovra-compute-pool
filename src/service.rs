@@ -187,20 +187,27 @@ pub fn install(role: Role, join: Option<(String, Token)>, args: &[String]) -> Re
 /// Stops, disables and removes the service. The agent's join settings go with it.
 pub fn uninstall(role: Role) -> Result<()> {
     let unit = unit_path(role)?;
-    if !unit.exists() {
-        println!("{} is not installed.", role.unit_name());
-        return Ok(());
+    let installed = unit
+        .try_exists()
+        .with_context(|| format!("checking {}", unit.display()))?;
+    if installed {
+        systemctl(&["disable", "--now", role.unit_name()])?;
     }
-    systemctl(&["disable", "--now", role.unit_name()])?;
-    std::fs::remove_file(&unit).with_context(|| format!("removing {}", unit.display()))?;
+    // Install writes the agent credentials before writing its unit. An interrupted
+    // install or an earlier partial uninstall may have left only the credentials.
     if role == Role::Agent {
         match std::fs::remove_file(agent_env_path()?) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
     }
-    systemctl(&["daemon-reload"])?;
-    println!("{} is stopped and removed.", role.unit_name());
+    if installed {
+        std::fs::remove_file(&unit).with_context(|| format!("removing {}", unit.display()))?;
+        systemctl(&["daemon-reload"])?;
+        println!("{} is stopped and removed.", role.unit_name());
+    } else {
+        println!("{} is not installed.", role.unit_name());
+    }
     Ok(())
 }
 

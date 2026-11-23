@@ -37,6 +37,31 @@ fn free_port() -> u16 {
         .port()
 }
 
+#[test]
+fn uninstall_cleans_leftover_agent_credentials_after_an_interrupted_install() {
+    let config = std::env::temp_dir().join(format!("da-cleanup-{}", std::process::id()));
+    let settings = config.join("dist-alloc");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::create_dir(&settings).unwrap();
+    let credentials = settings.join("agent.env");
+    std::fs::write(&credentials, b"test settings").unwrap();
+    let keep = settings.join("user-notes");
+    std::fs::write(&keep, b"keep me").unwrap();
+    for role in ["server", "agent", "agent"] {
+        assert!(
+            Command::new(BIN)
+                .args(["service", "uninstall", role])
+                .env("XDG_CONFIG_HOME", &config)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(credentials.exists(), role == "server");
+        assert!(keep.exists());
+    }
+    std::fs::remove_dir_all(config).unwrap();
+}
+
 fn daemon(args: &[&str], log: &Path) -> Daemon {
     let log = std::fs::File::create(log).unwrap();
     Daemon(
